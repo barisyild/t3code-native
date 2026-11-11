@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>T3 Code</string>
+  <key>CFBundleExecutable</key>
+  <string>T3Code</string>
+  <key>CFBundleIconFile</key>
+  <string>T3Code.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.t3tools.t3code.appkit</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>T3 Code</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Connect to T3 Code servers on your local network.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Record audio for voice input or for an MCP app you allow.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Use the camera in an MCP app you allow.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>Share your location with an MCP app you allow.</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
