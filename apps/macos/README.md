@@ -5,6 +5,13 @@ live in this directory. Keep this directory as an additive change when merging u
 updates. AppKit uses T3 Code's pairing API and orchestration v2 WebSocket protocol, so it
 can use the same server as the Electron, web, and mobile clients.
 
+Download the Apple Silicon build from [GitHub Releases](https://github.com/barisyild/t3code-native/releases)
+and unzip **T3 Code AppKit.app** on macOS 14 or later. Pair a running T3 environment
+or install the `t3` CLI to start a local server.
+
+Pushing an `appkit-vMAJOR.MINOR.PATCH` tag builds the tagged commit and publishes
+the app ZIP to GitHub Releases.
+
 ## Build and connect
 
 To add AppKit to a T3 Code source checkout, place this directory at `apps/macos` in

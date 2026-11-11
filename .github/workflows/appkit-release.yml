@@ -1,0 +1,74 @@
+name: AppKit Release
+
+on:
+  push:
+    tags:
+      - "appkit-v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appkit-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish for Apple Silicon
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: apps/macos
+
+      - name: Build and verify the app archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^appkit-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Expected an AppKit release tag such as appkit-v0.0.1." >&2
+            exit 1
+          fi
+          version=${BASH_REMATCH[1]}
+          test "$(uname -m)" = arm64
+
+          app=$(sh apps/macos/build.sh --client-only)
+          plist="$app/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "$version" "$plist"
+          plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$plist"
+          install -m 644 LICENSE "$app/Contents/Resources/T3Code-LICENSE.txt"
+          codesign --force --sign - "$app"
+
+          archive="$RUNNER_TEMP/T3-Code-AppKit-$version-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          unpacked="$RUNNER_TEMP/appkit-verification"
+          ditto -x -k "$archive" "$unpacked"
+          verified="$unpacked/$(basename "$app")"
+          codesign --verify --deep --strict "$verified"
+          lipo -verify_arch arm64 "$verified/Contents/MacOS/T3Code"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$verified/Contents/Info.plist")" = "$version"
+
+          printf 'version=%s\narchive=%s\n' "$version" "$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPKIT_VERSION: ${{ steps.package.outputs.version }}
+          APPKIT_ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/appkit-release-notes.md"
+          cat > "$notes" <<'NOTES'
+          Native T3 Code client for Apple Silicon Macs running macOS 14 or later.
+
+          Unzip the download and open **T3 Code AppKit.app**. Choose **Pair Environment** to connect to a running T3 server, or [install the `t3` CLI](https://github.com/pingdotgg/t3code#installation) to use **Start Local Server**.
+
+          The app uses an ad-hoc signature. If macOS blocks the first launch, follow [Apple's Open Anyway instructions](https://support.apple.com/en-us/102445).
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "$APPKIT_ARCHIVE" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "T3 Code AppKit $APPKIT_VERSION" --notes-file "$notes"
