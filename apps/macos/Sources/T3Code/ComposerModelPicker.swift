@@ -8,7 +8,6 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         let groups: [ComposerModels.Group]
         let details: ComposerModels.GroupKey?
         let selection: Wire
-        let optionsHeight: CGFloat
     }
 
     private lazy var trigger = ActionButton("Model settings", style: .subtle) { [weak self] in self?.toggle() }
@@ -19,6 +18,7 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
     private var preferred: Wire = .null
     private var modelOptions = ComposerModelOptions()
     private var promptEffort = false
+    private var showingModels = false
     private var browsing: ComposerProvider?
     private var details: ComposerModels.GroupKey?
     private var rendered: MenuState?
@@ -38,6 +38,11 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         trigger.isEnabled = false
         fill(trigger, in: self)
         options.onPick = { [weak self] id, value in self?.onPickOption?(id, value) }
+        options.onBrowseModels = { [weak self] in self?.showModels() }
+        options.onBrowseProviders = { [weak self] anchor in
+            guard let self, canOpen else { return }
+            providerMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height), in: anchor)
+        }
     }
 
     @available(*, unavailable)
@@ -65,7 +70,8 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
 
     func show() {
         guard canOpen, trigger.window != nil, popover?.isShown != true else { return }
-        browsing = catalog.family(for: selection)
+        showingModels = false
+        browsing = nil
         details = nil
         let controller = NSViewController()
         controller.view = Surface(WorkspaceStyle.modelPanel)
@@ -103,6 +109,25 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         guard let popover, let controller = popover.contentViewController else { return }
         let available = Set(ComposerProvider.allCases.filter(catalog.isAvailable))
         let current = catalog.family(for: selection)
+        if !showingModels {
+            options.render(modelOptions, modelName: catalog.pickerTitle(for: selection) ?? "Select model",
+                           provider: current, icon: current.flatMap { icons[$0] } ?? trigger.image ?? NSImage(),
+                           canBrowseProviders: !available.isEmpty, enabled: canOpen, promptEffort: promptEffort)
+            let content = controller.view
+            let inset: CGFloat = 9
+            if options.superview !== content {
+                content.subviews.forEach { $0.removeFromSuperview() }
+                fill(options, in: content, inset: inset)
+            }
+            let size = NSSize(width: 248, height: options.preferredHeight + 2 * inset)
+            if popover.contentSize != size {
+                controller.preferredContentSize = size
+                popover.contentSize = size
+            }
+            rendered = nil
+            return
+        }
+
         if let browsing, browsing != current && !available.contains(browsing) {
             self.browsing = current
             details = nil
@@ -110,11 +135,10 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         let listing = browsing.flatMap { family in
             family == current ? nil : catalog.defaultSelection(for: family, preferred: preferred)
         } ?? selection
-        let groups = catalog.groups(preserving: listing)
+        let groups = catalog.groups(preserving: modelWithoutOptions(listing))
         let group = details.flatMap { key in groups.first { $0.key == key } }
-        options.render(modelOptions, enabled: canOpen, promptEffort: promptEffort, visible: browsing == current)
         let state = MenuState(family: browsing, available: available, groups: groups, details: group?.key,
-                              selection: selection, optionsHeight: options.preferredHeight)
+                              selection: modelWithoutOptions(selection))
         guard state != rendered else { return }
         rendered = state
 
@@ -141,7 +165,12 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
             back.font = .systemFont(ofSize: 12)
             leading = row([back, label(group.title, size: 12, weight: .semibold, color: WorkspaceStyle.ink)], spacing: 8)
         } else {
-            leading = label("Models", size: 13, weight: .semibold, color: WorkspaceStyle.ink)
+            let back = ActionButton("Models", symbol: "chevron.left", style: .subtle) { [weak self] in
+                self?.showingModels = false
+                self?.updateMenu()
+            }
+            back.setAccessibilityLabel("Back to model settings")
+            leading = back
         }
         let header = row([leading, NSView()] + controls, spacing: 4)
         header.heightAnchor.constraint(equalToConstant: 28).isActive = true
@@ -149,19 +178,52 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         let listHeight = rows.reduce(0) { $0 + $1.height } + CGFloat(max(0, rows.count - 1)) * 2
         let list = column(rows.map(\.view), spacing: 2, alignment: .width)
         let body = listHeight > 211 ? scrollingList(list, height: 211) : list
-        var sections: [NSView] = [header, divider(), body]
-        if !options.isHidden { sections += [divider(), options] }
+        let sections: [NSView] = [header, divider(), body]
         let layout = column(sections, spacing: 7, alignment: .width)
         let inset: CGFloat = 11
         let width: CGFloat = 306
         layout.widthAnchor.constraint(equalToConstant: width - 2 * inset).isActive = true
-        let height = 2 * inset + 29 + min(listHeight, 211) + CGFloat(sections.count - 1) * 7 +
-            (options.isHidden ? 0 : 1 + options.preferredHeight)
+        let height = 2 * inset + 29 + min(listHeight, 211) + CGFloat(sections.count - 1) * 7
         let content = controller.view
         content.subviews.forEach { $0.removeFromSuperview() }
         fill(layout, in: content, inset: inset)
         controller.preferredContentSize = NSSize(width: width, height: height)
         popover.contentSize = controller.preferredContentSize
+    }
+
+    private func modelWithoutOptions(_ model: Wire) -> Wire {
+        guard var fields = model.object else { return model }
+        fields["options"] = nil
+        return .object(fields)
+    }
+
+    private func providerMenu() -> NSMenu {
+        let menu = NSMenu(title: "Providers")
+        menu.autoenablesItems = false
+        let current = catalog.family(for: selection)
+        for family in ComposerProvider.allCases {
+            let item = menuItem(family.title, target: self, action: #selector(chooseProvider(_:)))
+            item.image = icons[family]
+            item.representedObject = family.rawValue
+            item.state = current == family ? .on : .off
+            item.isEnabled = catalog.isAvailable(family)
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func chooseProvider(_ item: NSMenuItem) {
+        guard let value = item.representedObject as? String, let family = ComposerProvider(rawValue: value),
+              catalog.isAvailable(family) else { return }
+        showModels(for: family)
+    }
+
+    private func showModels(for family: ComposerProvider? = nil) {
+        guard canOpen else { return }
+        showingModels = true
+        browsing = family ?? catalog.family(for: selection) ?? ComposerProvider.allCases.first(where: catalog.isAvailable)
+        details = nil
+        updateMenu()
     }
 
     private func browse(_ family: ComposerProvider) {
@@ -225,8 +287,10 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
     }
 
     private func pick(_ model: Wire) {
-        guard canOpen, !isSelected(model) else { return }
-        onPickModel?(model)
+        guard canOpen else { return }
+        showingModels = false
+        if !isSelected(model) { onPickModel?(model) }
+        updateMenu()
     }
 
     private func menuRow(_ title: String, detail: String?, symbol: String?, selected: Bool,

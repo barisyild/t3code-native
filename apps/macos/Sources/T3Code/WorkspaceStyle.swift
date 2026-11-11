@@ -10,7 +10,8 @@ enum WorkspaceStyle {
     static let accent = color(0xD18568, 0xA3482F)
     static let quota = color(0xF5B52D, 0x936200)
     static let modelFocus = color(0x5196FF, 0x245FBC)
-    static let modelPanel = color(0x2E2E31, 0xF6F6F8)
+    static let modelPanel = color(0x2C2B2B, 0xF6F6F8)
+    static let effortFill = color(0x397FEB, 0x245FBC)
 
     static let line = color(0x202022, 0xE0E0E3)
     static let outline = color(0x2C2C2F, 0xDCDCE1)
