@@ -10,7 +10,8 @@ and unzip **T3 Code AppKit.app** on macOS 14 or later. Pair a running T3 environ
 or install the `t3` CLI to start a local server.
 
 Pushing an `appkit-vMAJOR.MINOR.PATCH` tag builds the tagged commit and publishes
-the app ZIP to GitHub Releases.
+the app ZIP to GitHub Releases. **AppKit Release** can also be run manually
+from GitHub Actions with an existing release tag.
 
 ## Build and connect
 

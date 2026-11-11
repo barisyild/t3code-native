@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "appkit-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing AppKit release tag
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: appkit-release-${{ github.ref }}
+  group: appkit-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -18,46 +24,58 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          APPKIT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$APPKIT_TAG" =~ ^appkit-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Expected an AppKit release tag such as appkit-v0.0.1." >&2
+            exit 1
+          fi
+          printf 'tag=%s\nversion=%s\n' "$APPKIT_TAG" "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
           persist-credentials: false
           sparse-checkout: apps/macos
 
       - name: Build and verify the app archive
         id: package
         shell: bash
+        env:
+          APPKIT_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ ! "$GITHUB_REF_NAME" =~ ^appkit-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "Expected an AppKit release tag such as appkit-v0.0.1." >&2
-            exit 1
-          fi
-          version=${BASH_REMATCH[1]}
           test "$(uname -m)" = arm64
 
           app=$(sh apps/macos/build.sh --client-only)
           plist="$app/Contents/Info.plist"
-          plutil -replace CFBundleShortVersionString -string "$version" "$plist"
+          plutil -replace CFBundleShortVersionString -string "$APPKIT_VERSION" "$plist"
           plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$plist"
           install -m 644 LICENSE "$app/Contents/Resources/T3Code-LICENSE.txt"
           codesign --force --sign - "$app"
 
-          archive="$RUNNER_TEMP/T3-Code-AppKit-$version-macos-arm64.zip"
+          archive="$RUNNER_TEMP/T3-Code-AppKit-$APPKIT_VERSION-macos-arm64.zip"
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
           unpacked="$RUNNER_TEMP/appkit-verification"
           ditto -x -k "$archive" "$unpacked"
           verified="$unpacked/$(basename "$app")"
           codesign --verify --deep --strict "$verified"
           lipo -verify_arch arm64 "$verified/Contents/MacOS/T3Code"
-          test "$(plutil -extract CFBundleShortVersionString raw -o - "$verified/Contents/Info.plist")" = "$version"
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$verified/Contents/Info.plist")" = "$APPKIT_VERSION"
 
-          printf 'version=%s\narchive=%s\n' "$version" "$archive" >> "$GITHUB_OUTPUT"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          APPKIT_VERSION: ${{ steps.package.outputs.version }}
+          APPKIT_TAG: ${{ steps.release.outputs.tag }}
+          APPKIT_VERSION: ${{ steps.release.outputs.version }}
           APPKIT_ARCHIVE: ${{ steps.package.outputs.archive }}
         run: |
           set -euo pipefail
@@ -69,6 +87,6 @@ jobs:
 
           The app uses an ad-hoc signature. If macOS blocks the first launch, follow [Apple's Open Anyway instructions](https://support.apple.com/en-us/102445).
           NOTES
-          gh release create "$GITHUB_REF_NAME" "$APPKIT_ARCHIVE" \
+          gh release create "$APPKIT_TAG" "$APPKIT_ARCHIVE" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "T3 Code AppKit $APPKIT_VERSION" --notes-file "$notes"
