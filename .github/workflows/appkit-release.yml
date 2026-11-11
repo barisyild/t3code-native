@@ -21,7 +21,7 @@ concurrency:
 jobs:
   publish:
     name: Build and publish for Apple Silicon
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - name: Resolve release tag
@@ -57,6 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
+          xcodebuild -version
 
           app=$(sh apps/macos/build.sh --client-only)
           plist="$app/Contents/Info.plist"

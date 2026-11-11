@@ -18,7 +18,7 @@ from GitHub Actions with an existing release tag.
 To add AppKit to a T3 Code source checkout, place this directory at `apps/macos` in
 that checkout and build from there.
 
-Use macOS 14 or later and Xcode with Swift 6.2 or later. From this directory, run
+The app targets macOS 14 or later. Build with Xcode 27. From this directory, run
 `sh build.sh --open` to build and open **T3 Code AppKit**. Run `sh build.sh` to build it
 and print the path to the signed bundle. The build uses the Swift dependencies pinned
 in `Package.resolved`.
