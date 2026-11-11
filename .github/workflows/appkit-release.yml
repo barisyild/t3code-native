@@ -37,11 +37,17 @@ jobs:
           fi
           printf 'tag=%s\nversion=%s\n' "$APPKIT_TAG" "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: refs/tags/${{ steps.release.outputs.tag }}
-          persist-credentials: false
-          sparse-checkout: apps/macos
+      - name: Check out the tagged AppKit sources
+        shell: bash
+        env:
+          APPKIT_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git sparse-checkout set apps/macos
+          git fetch --no-tags --depth=1 --filter=blob:none origin "refs/tags/$APPKIT_TAG"
+          git checkout --detach FETCH_HEAD
 
       - name: Build and verify the app archive
         id: package
