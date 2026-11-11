@@ -4,12 +4,15 @@ struct AssistantCitation: Equatable, Sendable {
     static let prefix = "t3-citation://v1/"
     static let maximumText = 8_000
     static let maximumComment = 8_000
-    private static let maximumHref = 160_000
+    // Server-issued IDs are opaque. Bound the encoded link as a whole.
+    private static let maximumHref = 512 * 1024
     private static let maximumOffset = 9_007_199_254_740_991
     private static let contextLength = 32
     private static let pathCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
     private static let queryCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789*-._")
-    private static let link = try! NSRegularExpression(pattern: #"\[Assistant quote\]\((t3-citation://v1/[^\s)]{1,159983})\)"#)
+    private static let link = try! NSRegularExpression(
+        pattern: #"\[Assistant quote\]\((\#(NSRegularExpression.escapedPattern(for: prefix))[^\s)]{1,\#(maximumHref - prefix.utf16.count)})\)"#
+    )
 
     let environmentID: String
     let threadID: String
@@ -39,7 +42,7 @@ struct AssistantCitation: Equatable, Sendable {
     }
 
     private static func validID(_ value: String) -> Bool {
-        !value.isEmpty && value.utf16.count <= 512 && value == value.trimmingCharacters(in: .whitespacesAndNewlines) &&
+        !value.isEmpty && value == value.trimmingCharacters(in: .whitespacesAndNewlines) &&
             value != "." && value != ".."
     }
 
@@ -53,8 +56,10 @@ struct AssistantCitation: Equatable, Sendable {
         let end = normalized.offset(for: NSMaxRange(range), end: true)
         let before = Self.boundedSuffix(normalized.text.substring(to: start), length: contextLength)
         let after = Self.boundedPrefix(normalized.text.substring(from: end), length: contextLength)
-        return Self(environmentID: environmentID, threadID: threadID, messageID: messageID, text: quote, comment: nil,
-                    start: start, end: end, before: before, after: after)
+        guard let citation = Self(environmentID: environmentID, threadID: threadID, messageID: messageID, text: quote, comment: nil,
+                                  start: start, end: end, before: before, after: after),
+              citation.href.utf16.count <= maximumHref else { return nil }
+        return citation
     }
 
     func replacingComment(_ value: String) throws -> Self {
@@ -63,6 +68,7 @@ struct AssistantCitation: Equatable, Sendable {
                               comment: comment.isEmpty ? nil : comment, start: start, end: end, before: before, after: after) else {
             throw ClientError.message("Use up to 8,000 characters for a quote comment.")
         }
+        guard next.href.utf16.count <= Self.maximumHref else { throw ClientError.message("This quote link is too long.") }
         return next
     }
 

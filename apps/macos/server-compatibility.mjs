@@ -1,13 +1,13 @@
-import { realpathSync } from "node:fs";
+import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
-import { dirname, join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 const entrypointPath = "apps/server/src/bin.ts";
 const browserModule = "apps/server/src/preview/ServerBrowser.ts";
 const contextModule = "packages/shared/src/composerContextReferences.ts";
 
-const browserChanges = [
+const browserZoomChanges = [
   [
     "    const size = tab.page.viewportSize();\n" +
       "    if (!size) return;\n" +
@@ -38,6 +38,13 @@ const browserChanges = [
       "        await tab.page.setViewportSize({ width, height });\n" +
       "        if (tab.zoomFactor !== 1) await applyZoom(tab);\n" +
       "        await broadcastViewport(tab);",
+  ],
+];
+
+const browserViewerChanges = [
+  [
+    "    if (!screencastStarted) yield* Effect.promise(pushStill);\n    return {",
+    "    if (!screencastStarted) yield* Effect.forkScoped(Effect.promise(pushStill));\n    return {",
   ],
 ];
 
@@ -74,31 +81,47 @@ const contextChanges = [
 ];
 
 const changes = new Map([
-  [browserModule, browserChanges],
-  [contextModule, contextChanges],
+  [browserModule, [browserZoomChanges, browserViewerChanges]],
+  [contextModule, [contextChanges]],
 ]);
 
 export function applyServerCompatibility(path, source) {
-  const edits = changes.get(path);
-  if (!edits) return source;
-  // Apply a fix only when every original block still matches exactly once.
-  if (!edits.every(([before]) => {
-    const offset = source.indexOf(before);
-    return offset !== -1 && source.indexOf(before, offset + 1) === -1;
-  })) return source;
-  return edits.reduce((current, [before, after]) => current.replace(before, () => after), source);
+  let updated = source;
+  for (const edits of changes.get(path) ?? []) {
+    // A fix is atomic, and unrelated fixes can still apply after source changes.
+    if (
+      !edits.every(([before]) => {
+        const offset = updated.indexOf(before);
+        return offset !== -1 && updated.indexOf(before, offset + 1) === -1;
+      })
+    )
+      continue;
+    updated = edits.reduce(
+      (current, [before, after]) => current.replace(before, () => after),
+      updated,
+    );
+  }
+  return updated;
 }
 
 export function registerServerCompatibility(checkout) {
   if (typeof NodeModule.registerHooks !== "function") return undefined;
-  const root = realpathSync(checkout);
-  const urls = new Map([...changes.keys()].map((path) => [pathToFileURL(join(root, path)).href, path]));
+  const root = NodeFS.realpathSync(checkout);
+  const urls = new Map(
+    [...changes.keys()].map((path) => [
+      NodeURL.pathToFileURL(NodePath.join(root, path)).href,
+      path,
+    ]),
+  );
   return NodeModule.registerHooks({
     load(url, context, nextLoad) {
       const loaded = nextLoad(url, context);
       const path = urls.get(url);
       if (path === undefined || loaded.source == null) return loaded;
-      const source = typeof loaded.source === "string" ? loaded.source : Buffer.from(loaded.source).toString("utf8");
+      const source =
+        typeof loaded.source === "string"
+          ? loaded.source
+          : Buffer.from(loaded.source).toString("utf8");
       const updated = applyServerCompatibility(path, source);
       return updated === source ? loaded : { ...loaded, source: updated };
     },
@@ -106,7 +129,8 @@ export function registerServerCompatibility(checkout) {
 }
 
 if (process.argv[1]?.endsWith("/" + entrypointPath)) {
-  const entrypoint = realpathSync(process.argv[1]);
-  const checkout = dirname(dirname(dirname(dirname(entrypoint))));
-  if (relative(checkout, entrypoint) === entrypointPath) registerServerCompatibility(checkout);
+  const entrypoint = NodeFS.realpathSync(process.argv[1]);
+  const checkout = NodePath.resolve(NodePath.dirname(entrypoint), "../../..");
+  if (NodePath.relative(checkout, entrypoint) === entrypointPath)
+    registerServerCompatibility(checkout);
 }

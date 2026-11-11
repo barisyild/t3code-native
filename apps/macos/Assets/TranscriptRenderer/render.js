@@ -1,7 +1,7 @@
 const artwork = document.querySelector("#artwork");
 const unsafeAttributes = ["href", "xlink:href", "src", "srcset"];
 
-function renderArtwork(kind, source, dark, inlineFontSize) {
+globalThis.renderArtwork = (kind, source, dark, inlineFontSize) => {
   const inline = kind === "math" && inlineFontSize > 0;
   document.documentElement.dataset.appearance = dark ? "dark" : "light";
   document.documentElement.dataset.kind = kind;
@@ -59,7 +59,9 @@ function renderArtwork(kind, source, dark, inlineFontSize) {
   const { width, height } = bounds;
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 2 || height <= 0) return null;
   const scale = Math.min(1, 1080 / width, 1400 / height);
-  const descent = baseline ? Math.max(0, bounds.bottom - baseline.getBoundingClientRect().bottom) * scale : 0;
+  const descent = baseline
+    ? Math.max(0, bounds.bottom - baseline.getBoundingClientRect().bottom) * scale
+    : 0;
   if (scale < 1) artwork.style.transform = "scale(" + scale + ")";
   return { width: Math.ceil(width * scale), height: Math.ceil(height * scale), descent };
-}
+};

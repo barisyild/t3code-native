@@ -1,15 +1,15 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { join, resolve } from "node:path";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
 
 const [checkoutPath, outputPath, moduleName = "math"] = process.argv.slice(2);
 if (!checkoutPath || !outputPath) {
   throw new Error("Usage: node prepare-transcript-math.mjs CHECKOUT DESTINATION [math|mcp-app]");
 }
 
-const checkout = resolve(checkoutPath);
-const output = resolve(outputPath);
-const { build } = createRequire(join(checkout, "package.json"))("vite-plus");
+const checkout = NodePath.resolve(checkoutPath);
+const output = NodePath.resolve(outputPath);
+const { build } = NodeModule.createRequire(NodePath.join(checkout, "package.json"))("vite-plus");
 const modules = {
   math: {
     entry: "packages/shared/src/markdownMath.ts",
@@ -41,7 +41,7 @@ await build({
       resolveId(id, importer) {
         // JavaScriptCore has no DOM for the browser entity decoder.
         if (id === "decode-named-character-reference" && importer) {
-          return createRequire(importer).resolve(id);
+          return NodeModule.createRequire(importer).resolve(id);
         }
       },
     },
@@ -55,7 +55,7 @@ await build({
     license: { fileName: licenseName },
     minify: true,
     lib: {
-      entry: join(checkout, module.entry),
+      entry: NodePath.join(checkout, module.entry),
       name: module.globalName,
       formats: ["iife"],
       fileName: () => module.fileName,
@@ -63,6 +63,6 @@ await build({
   },
 });
 
-const notice = await readFile(join(checkout, "LICENSE"), "utf8");
-const dependencies = await readFile(join(output, licenseName), "utf8");
-await writeFile(join(output, licenseName), notice + "\n" + dependencies);
+const notice = await NodeFSP.readFile(NodePath.join(checkout, "LICENSE"), "utf8");
+const dependencies = await NodeFSP.readFile(NodePath.join(output, licenseName), "utf8");
+await NodeFSP.writeFile(NodePath.join(output, licenseName), notice + "\n" + dependencies);

@@ -33,11 +33,17 @@ It keeps its data in
 checkout, run `vp run dev --home-dir /tmp/t3code-appkit-dev --no-seed` in the T3 repo and
 pair with that environment.
 
-The source launcher loads the AppKit compatibility module for browser zoom and
-assistant-quote delivery. It applies the fixes in memory when the corresponding
-upstream code matches. To use the same fixes on a separate source host, start
-that host with `node --import ./apps/macos/server-compatibility.mjs apps/server/src/bin.ts`
+The source launcher loads the AppKit compatibility module for browser zoom,
+browser stream startup, and assistant-quote delivery. It applies each fix in
+memory when the corresponding upstream code matches. For a separate source
+host, run `node --import ./apps/macos/server-compatibility.mjs apps/server/src/bin.ts`
 from its checkout.
+
+After merging upstream, run `swift test --package-path apps/macos` and
+`vp test run apps/macos/server-compatibility.test.mjs` from the checkout root.
+Use the checkout’s pinned Node version. The compatibility tests catch source
+changes that disable a shim. Remove the corresponding shim when upstream ships
+the fix and verify the behavior with the unmodified server.
 
 Use **File → Add Project** to open an existing folder, create a named Git project,
 or clone a repository on the connected environment. **Browse on Host** lists that

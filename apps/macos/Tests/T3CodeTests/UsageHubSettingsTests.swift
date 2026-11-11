@@ -56,8 +56,8 @@ struct UsageHubSettingsTests {
         ])))
         let first = try #require(source.accounts.first)
         #expect(first.title == "first.json")
-        #expect(first.resetTarget?.payload == ["sourceId": .string("hub"), "accountId": .string("first.json"), "creditId": .string("credit-one")])
-        #expect(source.accounts.last?.resetTarget == nil)
+        #expect(first.resets.first?.target?.payload == ["sourceId": .string("hub"), "accountId": .string("first.json"), "creditId": .string("credit-one")])
+        #expect(source.accounts.last?.resets.first?.target == nil)
     }
 
     private func configuration(_ id: String, url: String, label: String) throws -> UsageHubConfiguration {

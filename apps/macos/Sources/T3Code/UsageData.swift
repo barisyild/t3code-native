@@ -146,6 +146,14 @@ struct UsageReport {
 }
 
 struct UsageLimitAccount: Equatable {
+    struct Reset: Equatable {
+        let label: String?
+        let description: String?
+        let count: Int
+        let expiresAt: Date?
+        let target: UsageResetTarget?
+    }
+
     struct Window: Equatable {
         let id: String?
         let kind: String?
@@ -190,8 +198,7 @@ struct UsageLimitAccount: Equatable {
     let windows: [Window]
     let notice: String?
     let resetCredits: Int?
-    let resetCreditExpires: Date?
-    let resetTarget: UsageResetTarget?
+    let resets: [Reset]
     let identity: Identity?
     let externalUsage: ExternalUsage?
 
@@ -208,9 +215,25 @@ struct UsageLimitAccount: Equatable {
         notice = limits["unavailable"]["reason"].string.map { _ in
             limits["unavailable"]["message"].string ?? "Couldn’t refresh these limits."
         }
-        resetCredits = limits["resetCredits"]["availableCount"].int
-        resetCreditExpires = WorkspaceStyle.date(limits["resetCredits"]["nextExpiresAt"].string)
-        self.resetTarget = (resetCredits ?? 0) > 0 ? resetTarget : nil
+        let credits = limits["resetCredits"]
+        resetCredits = credits["availableCount"].int
+        let options = credits["options"]
+        if case .provider(let instance, _) = resetTarget, case .array(let reported) = options {
+            resets = reported.compactMap { option in
+                guard let id = option["creditId"].string, !id.isEmpty,
+                      let label = option["label"].string, !label.isEmpty,
+                      let count = option["availableCount"].int, count > 0 else { return nil }
+                return Reset(label: label, description: option["description"].string, count: count,
+                             expiresAt: WorkspaceStyle.date(option["expiresAt"].string),
+                             target: .provider(instance, creditID: id))
+            }
+        } else if let resetCredits, resetCredits > 0 {
+            resets = [Reset(label: nil, description: nil, count: resetCredits,
+                            expiresAt: WorkspaceStyle.date(credits["nextExpiresAt"].string),
+                            target: options == .null ? resetTarget : nil)]
+        } else {
+            resets = []
+        }
         windows = limits["windows"].array.compactMap { window in
             guard let label = window["label"].string, let used = window["usedPercent"].double,
                   (0...100).contains(used) else { return nil }
@@ -290,14 +313,17 @@ struct UsageLimitSource: Equatable {
 }
 
 enum UsageResetTarget: Equatable, Sendable {
-    case provider(String)
+    case provider(String, creditID: String? = nil)
     case hub(sourceID: String, accountID: String, creditID: String)
 
     var payload: Payload {
         switch self {
-        case .provider(let id): ["instanceId": .string(id)]
+        case .provider(let id, let credit):
+            var payload: Payload = ["instanceId": .string(id)]
+            if let credit { payload["creditId"] = .string(credit) }
+            return payload
         case .hub(let source, let account, let credit):
-            ["sourceId": .string(source), "accountId": .string(account), "creditId": .string(credit)]
+            return ["sourceId": .string(source), "accountId": .string(account), "creditId": .string(credit)]
         }
     }
 }

@@ -1,4 +1,4 @@
-function startT3McpApp(app, initialContext, hostVersion) {
+globalThis.startT3McpApp = (app, initialContext, hostVersion) => {
   let context = initialContext;
   let stopped = false;
   let frameLoaded = false;
@@ -6,6 +6,7 @@ function startT3McpApp(app, initialContext, hostVersion) {
   const native = async (method, params = {}) => {
     if (stopped) throw new T3McpApp.McpAppHostRefusal({ message: "The app was closed." });
     try {
+      // oxlint-disable-next-line unicorn/require-post-message-target-origin -- The WebKit message handler takes a body.
       return await window.webkit.messageHandlers.mcpApp.postMessage({ method, params });
     } catch (error) {
       throw new T3McpApp.McpAppHostRefusal({
@@ -39,23 +40,32 @@ function startT3McpApp(app, initialContext, hostVersion) {
           return { _tag: "embedded", name: file.name, base64: btoa(text) };
         }),
       }),
-    onRequestTeardown: () => { void native("requestTeardown").catch(() => {}); },
-    onSizeChanged: (size) => { void native("size", size).catch(() => {}); },
+    onRequestTeardown: () => {
+      void native("requestTeardown").catch(() => {});
+    },
+    onSizeChanged: (size) => {
+      void native("size", size).catch(() => {});
+    },
   });
   const receive = (event) => {
-    if (!stopped && event.source !== null && event.source === frame()?.contentWindow) host.receive(event.data);
+    if (!stopped && event.source !== null && event.source === frame()?.contentWindow)
+      host.receive(event.data);
   };
   window.addEventListener("message", receive);
-  document.addEventListener("load", (event) => {
-    if (event.target !== frame()) return;
-    if (frameLoaded) {
-      void native("leftPage").catch(() => {});
-      stopped = true;
-      host.dispose();
-    } else {
-      frameLoaded = true;
-    }
-  }, true);
+  document.addEventListener(
+    "load",
+    (event) => {
+      if (event.target !== frame()) return;
+      if (frameLoaded) {
+        void native("leftPage").catch(() => {});
+        stopped = true;
+        host.dispose();
+      } else {
+        frameLoaded = true;
+      }
+    },
+    true,
+  );
   globalThis.t3McpApp = {
     update(next) {
       context = next;
@@ -63,11 +73,13 @@ function startT3McpApp(app, initialContext, hostVersion) {
       document.documentElement.style.backgroundColor = next.styles.variables["--background"];
       host.updateHostContext();
     },
-    toolCall(call) { host.setToolCall(call); },
+    toolCall(call) {
+      host.setToolCall(call);
+    },
     async teardown() {
       await host.teardown();
       stopped = true;
       window.removeEventListener("message", receive);
     },
   };
-}
+};

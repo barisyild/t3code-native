@@ -366,15 +366,17 @@ final class UsageController: NSViewController {
                 progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
                 content += [row([label(window.label, size: 12), NSView(), label(reset, size: 11, color: WorkspaceStyle.muted), status]), progress]
             }
-            if let credits = account.resetCredits, credits > 0 {
-                let balance = credits == 1 ? "1 reset credit available" : "\(credits) reset credits available"
-                let expiry = account.resetCreditExpires.map { " · Expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-                let description = label(balance + expiry, size: 11.5, color: WorkspaceStyle.secondary)
-                if let target = account.resetTarget, workspace.can("providers:manage") {
+            for reset in account.resets {
+                let balance = reset.count == 1 ? "1 reset credit available" : "\(reset.count) reset credits available"
+                let expiry = reset.expiresAt.map { "Expires \($0.formatted(date: .abbreviated, time: .shortened))" }
+                let title = [reset.label, balance, expiry].compactMap { $0 }.joined(separator: " · ")
+                let description = label(title, size: 11.5, color: WorkspaceStyle.secondary)
+                description.toolTip = reset.description
+                if let target = reset.target, workspace.can("providers:manage") {
                     let use = ActionButton(redeeming == target ? "Using…" : "Use Reset…", style: .subtle) { [weak self] in
-                        self?.confirmReset(target, account: account.title)
+                        self?.confirmReset(target, reset: reset, account: account.title)
                     }
-                    use.setAccessibilityLabel("Use reset credit for \(account.title)")
+                    use.setAccessibilityLabel("Use \(reset.label ?? "reset credit") for \(account.title)")
                     use.isEnabled = redeeming == nil
                     content.append(row([description, NSView(), use]))
                 } else {
@@ -386,12 +388,13 @@ final class UsageController: NSViewController {
         return content
     }
 
-    private func confirmReset(_ target: UsageResetTarget, account: String) {
+    private func confirmReset(_ target: UsageResetTarget, reset: UsageLimitAccount.Reset, account: String) {
         guard redeeming == nil, workspace.can("providers:manage"), let connection = workspace.connectionID,
               let window = view.window, window.attachedSheet == nil else { return }
         let alert = NSAlert()
-        alert.messageText = "Use a reset credit for \(account)?"
-        alert.informativeText = "This spends one credit and clears the current rate-limit windows."
+        alert.messageText = "Use \(reset.label ?? "a reset credit") for \(account)?"
+        alert.informativeText = reset.description.map { "This spends one credit. \($0)" } ??
+            "This spends one credit and clears the current rate-limit windows."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Use Reset Credit")
         alert.beginSheetModal(for: window) { [weak self] response in

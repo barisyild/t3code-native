@@ -31,6 +31,17 @@ struct AssistantCitationTests {
         #expect((changed as NSString).substring(with: revealed) == "Keep this text.")
     }
 
+    @Test func quotesRoundTripLongProviderIdentifiersAndEncodedText() throws {
+        let identifier = String(repeating: "界", count: 4_096)
+        let quote = String(repeating: "字", count: AssistantCitation.maximumText)
+        let selection = AssistantCitation.selection(environmentID: identifier, threadID: identifier,
+                                                    messageID: identifier, rendered: quote,
+                                                    range: NSRange(location: 0, length: quote.utf16.count))
+        let citation = try #require(selection).replacingComment(String(repeating: "語", count: AssistantCitation.maximumComment))
+        #expect(AssistantCitation.parse(citation.href) == citation)
+        #expect(AssistantCitation.matches(in: citation.markdown).map(\.citation) == [citation])
+    }
+
     @Test func repeatedTextNeedsAnUnambiguousContextEvenAtTheSavedOffset() throws {
         let lead = String(repeating: "a", count: 40) + " "
         let tail = " " + String(repeating: "b", count: 40)

@@ -35,7 +35,7 @@ extension Workspace {
     func redeemUsageCredit(_ target: UsageResetTarget, connection: UUID) async throws -> UsageResetResult {
         guard connectionID == connection, can("providers:manage") else { throw ClientError.disconnected }
         let accounts = providers.compactMap(\.usageLimit) + usageLimitSources.flatMap(\.accounts)
-        guard accounts.contains(where: { $0.resetTarget == target }) else {
+        guard accounts.contains(where: { $0.resets.contains(where: { $0.target == target }) }) else {
             throw ClientError.message("The displayed reset credit is no longer available.")
         }
         let result = try await request("provider.consumeResetCredit", target.payload)

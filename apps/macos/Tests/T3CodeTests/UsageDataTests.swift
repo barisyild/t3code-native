@@ -69,6 +69,36 @@ struct UsageDataTests {
         #expect(shared.externalUsage?.url.absoluteString == "https://chatgpt.com/#settings/Usage")
     }
 
+    @Test func resetCreditSelectionUsesTheDisplayedGrant() throws {
+        let provider = try #require(Provider(.object([
+            "instanceId": .string("claude"), "driver": .string("claudeAgent"), "enabled": .bool(true),
+            "usageLimits": .object([
+                "checkedAt": .string("2026-11-11T10:00:00Z"), "windows": .array([]),
+                "resetCredits": .object([
+                    "availableCount": .int(3), "nextCreditId": .string("weekly"),
+                    "options": .array([
+                        .object(["creditId": .string("weekly"), "label": .string("Weekly reset"),
+                                 "description": .string("Resets weekly usage."), "availableCount": .int(2)]),
+                        .object(["creditId": .string("fable"), "label": .string("Fable reset"),
+                                 "description": .string("Resets Fable usage."), "availableCount": .int(1)]),
+                    ]),
+                ]),
+            ]),
+        ])))
+        let account = try #require(provider.usageLimit)
+        #expect(account.resets.map(\.label) == ["Weekly reset", "Fable reset"])
+        #expect(account.resets.map(\.count) == [2, 1])
+        #expect(account.resets.compactMap { $0.target?.payload } == [
+            ["instanceId": .string("claude"), "creditId": .string("weekly")],
+            ["instanceId": .string("claude"), "creditId": .string("fable")],
+        ])
+        let legacy = try #require(UsageLimitAccount(title: "Codex", detail: "Pro", driver: "codex", limits: .object([
+            "checkedAt": .string("2026-11-11T10:00:00Z"), "windows": .array([]),
+            "resetCredits": .object(["availableCount": .int(1)]),
+        ]), resetTarget: .provider("codex")))
+        #expect(legacy.resets.first?.target?.payload == ["instanceId": .string("codex")])
+    }
+
     @Test func quotaPreviewShowsOnlySharedAndApplicableModelWindows() throws {
         func window(_ id: String, label: String, used: Int) -> Wire {
             .object(["id": .string(id), "kind": .string("weekly"), "label": .string(label), "usedPercent": .int(used)])
