@@ -2,12 +2,53 @@ import AppKit
 
 @MainActor
 final class TranscriptBodyView: NSTextView {
+    private struct CodeControl {
+        let location: Int
+        let block: TranscriptCodeBlock
+        let button: ActionButton
+    }
+
     var onFileLink: ((WorkspaceFileReference) -> Void)?
     var onQuoteSelection: ((String, NSRange) -> Void)?
     var onCitation: ((AssistantCitation, NSRect) -> Void)?
     var onAppearanceChange: (() -> Void)?
     var terminalClipboardSource: TerminalContextClipboard.Source?
     private var terminalPopup: NSPopover?
+    private var codeControls: [CodeControl] = []
+
+    func setTranscript(_ content: NSAttributedString) {
+        textStorage?.setAttributedString(content)
+        for control in codeControls { control.button.removeFromSuperview() }
+        codeControls.removeAll()
+        content.enumerateAttribute(TranscriptCode.attribute, in: NSRange(location: 0, length: content.length)) { value, range, _ in
+            guard let code = value as? TranscriptCode, !code.text.isEmpty,
+                  let style = content.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle,
+                  let block = style.textBlocks.first as? TranscriptCodeBlock else { return }
+            let button = ActionButton(code.copyTitle, symbol: "doc.on.doc", iconOnly: true, style: .subtle) {
+                [weak self] in self?.writeCode(code)
+            }
+            button.isHidden = true
+            addSubview(button)
+            codeControls.append(.init(location: range.location, block: block, button: button))
+        }
+        if !codeControls.isEmpty { needsLayout = true }
+    }
+
+    override func layout() {
+        super.layout()
+        guard !codeControls.isEmpty, let layoutManager, let textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let origin = textContainerOrigin
+        for control in codeControls {
+            let glyph = layoutManager.glyphRange(forCharacterRange: NSRange(location: control.location, length: 1),
+                                                 actualCharacterRange: nil).location
+            let block = layoutManager.boundsRect(for: control.block, at: glyph, effectiveRange: nil)
+            control.button.isHidden = block.isEmpty
+            if !block.isEmpty {
+                control.button.frame = control.block.copyButtonFrame(in: block.offsetBy(dx: origin.x, dy: origin.y))
+            }
+        }
+    }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -36,12 +77,7 @@ final class TranscriptBodyView: NSTextView {
         let range = selectedRange()
         let menu = super.menu(for: event) ?? NSMenu()
         if let (code, image) = codeBlock(at: convert(event.locationInWindow, from: nil)), !code.text.isEmpty {
-            let title = switch code.artwork?.kind {
-            case .math: "Copy LaTeX"
-            case .mermaid: "Copy Mermaid Source"
-            case nil: "Copy Code"
-            }
-            let action = menuItem(title, target: self, action: #selector(copyCode(_:)))
+            let action = menuItem(code.copyTitle, target: self, action: #selector(copyCode(_:)))
             action.representedObject = code
             menu.insertItem(action, at: 0)
             if code.artwork?.kind == .mermaid, let image {
@@ -134,8 +170,13 @@ final class TranscriptBodyView: NSTextView {
 
     @objc private func copyCode(_ item: NSMenuItem) {
         guard let code = item.representedObject as? TranscriptCode else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(code.artwork?.source ?? code.text, forType: .string)
+        writeCode(code)
+    }
+
+    private func writeCode(_ code: TranscriptCode) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(code.artwork?.source ?? code.text, forType: .string)
     }
 
     @objc private func openDiagram(_ item: NSMenuItem) {

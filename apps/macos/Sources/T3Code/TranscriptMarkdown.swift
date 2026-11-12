@@ -6,9 +6,52 @@ final class TranscriptCode: NSObject {
     let text: String
     let artwork: TranscriptArtwork?
 
+    var copyTitle: String {
+        switch artwork?.kind {
+        case .math: "Copy LaTeX"
+        case .mermaid: "Copy Mermaid Source"
+        case nil: "Copy Code"
+        }
+    }
+
     init(_ text: String, artwork: TranscriptArtwork? = nil) {
         self.text = text
         self.artwork = artwork
+    }
+}
+
+final class TranscriptCodeBlock: NSTextBlock {
+    private static let margin: CGFloat = 5
+    private static let copySize = NSSize(width: 26, height: 22)
+
+    init(color: NSColor, showsCopy: Bool) {
+        super.init()
+        setContentWidth(100, type: .percentage)
+        setWidth(Self.margin, type: .absolute, for: .margin, edge: .minY)
+        setWidth(Self.margin, type: .absolute, for: .margin, edge: .maxY)
+        setWidth(10, type: .absolute, for: .padding)
+        if showsCopy { setWidth(29, type: .absolute, for: .padding, edge: .maxY) }
+        backgroundColor = color
+    }
+
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    private func surfaceFrame(in frame: NSRect) -> NSRect {
+        frame.insetBy(dx: 0, dy: Self.margin)
+    }
+
+    func copyButtonFrame(in frame: NSRect) -> NSRect {
+        let surface = surfaceFrame(in: frame)
+        let size = Self.copySize
+        return NSRect(x: surface.maxX - size.width - 5, y: surface.maxY - size.height - 3,
+                      width: size.width, height: size.height)
+    }
+
+    override func drawBackground(withFrame frameRect: NSRect, in controlView: NSView?,
+                                 characterRange: NSRange, layoutManager: NSLayoutManager) {
+        guard let backgroundColor else { return }
+        backgroundColor.setFill()
+        NSBezierPath(roundedRect: surfaceFrame(in: frameRect), xRadius: 8, yRadius: 8).fill()
     }
 }
 
@@ -90,7 +133,8 @@ enum TranscriptText {
                     let requested = TranscriptArtwork(kind: kind, source: text, dark: darkArtwork)
                     if context.allowsPreview(requested) { artwork = requested }
                 }
-                appendCode(TranscriptCode(text, artwork: artwork), language: language, color: color, to: output)
+                let syntax = streaming || artwork != nil ? nil : TranscriptSyntax(text, language: language, dark: darkArtwork)
+                appendCode(TranscriptCode(text, artwork: artwork), language: language, syntax: syntax, color: color, to: output)
             default:
                 appendParagraph(members, in: parsed, components: components, role: role, font: font, color: color,
                                 context: context, listItems: &listItems, to: output)
@@ -274,14 +318,9 @@ enum TranscriptText {
         return openingCount >= 3 && closingCount >= openingCount && closing.dropFirst(closingCount).allSatisfy(\.isWhitespace)
     }
 
-    private static func appendCode(_ code: TranscriptCode, language: String?, color: NSColor, to output: NSMutableAttributedString) {
-        let block = NSTextBlock()
-        block.setContentWidth(100, type: .percentage)
-        block.setWidth(3, type: .absolute, for: .margin)
-        block.setWidth(9, type: .absolute, for: .padding)
-        block.setWidth(1, type: .absolute, for: .border)
-        block.setBorderColor(WorkspaceStyle.outline)
-        block.backgroundColor = WorkspaceStyle.navigation
+    private static func appendCode(_ code: TranscriptCode, language: String?, syntax: TranscriptSyntax?,
+                                   color: NSColor, to output: NSMutableAttributedString) {
+        let block = TranscriptCodeBlock(color: WorkspaceStyle.commandPreview, showsCopy: !code.text.isEmpty)
         let style = NSMutableParagraphStyle()
         style.textBlocks = [block]
         style.lineBreakMode = .byCharWrapping
@@ -293,9 +332,7 @@ enum TranscriptText {
             style.alignment = .center
             preview.addAttributes(attributes, range: NSRange(location: 0, length: preview.length))
             output.append(preview)
-            output.append(NSAttributedString(string: "\n", attributes: [
-                .font: font, .foregroundColor: color, .paragraphStyle: style,
-            ]))
+            output.append(NSAttributedString(string: "\n", attributes: attributes))
         } else if language?.lowercased() == "diff" {
             let lines = code.text.components(separatedBy: "\n")
             for line in lines {
@@ -304,7 +341,12 @@ enum TranscriptText {
                 output.append(NSAttributedString(string: line + "\n", attributes: lineAttributes))
             }
         } else {
-            output.append(NSAttributedString(string: code.text + "\n", attributes: attributes))
+            let blockText = NSMutableAttributedString(string: code.text + "\n", attributes: attributes)
+            if let syntax, TranscriptSyntaxRenderer.shared.isAvailable, !TranscriptSyntaxRenderer.shared.apply(syntax, to: blockText) {
+                let start = blockText.mutableString.rangeOfComposedCharacterSequence(at: 0)
+                blockText.addAttribute(TranscriptSyntax.attribute, value: syntax, range: start)
+            }
+            output.append(blockText)
         }
     }
 

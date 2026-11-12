@@ -18,6 +18,58 @@ final class ConversationController: NSViewController {
         let connection: UUID
     }
 
+    private struct QueueEdit {
+        let id = UUID()
+        let scope: QueueScope
+        let runID: String
+        let originalAttachments: [Wire]
+        var draft: ComposerView.Draft
+        var attempt: Workspace.QueueEditAttempt?
+        var saving = false
+        var error: String?
+    }
+
+    private struct AttachmentTarget: Hashable {
+        let key: DraftKey
+        let editID: UUID?
+    }
+
+    private struct ApprovalTarget: Hashable {
+        let threadID: String
+        let requestID: String
+        let connection: UUID
+    }
+
+    private enum Activity {
+        case idle, queued, starting, working, waiting, stopping, background, approval, question, failed, offline, archived
+
+        var title: String {
+            switch self {
+            case .idle: "Idle"
+            case .queued: "Queued"
+            case .starting: "Starting"
+            case .working: "Working"
+            case .waiting: "Waiting"
+            case .stopping: "Stopping"
+            case .background: "Waiting on tasks"
+            case .approval: "Approval needed"
+            case .question: "Answer needed"
+            case .failed: "Failed"
+            case .offline: "Disconnected"
+            case .archived: "Archived"
+            }
+        }
+
+        @MainActor var tint: NSColor {
+            switch self {
+            case .idle, .offline, .archived: WorkspaceStyle.muted
+            case .approval, .question: WorkspaceStyle.quota
+            case .failed: WorkspaceStyle.negative
+            default: WorkspaceStyle.modelFocus
+            }
+        }
+    }
+
     private struct MessageJump {
         let scope: MessageSearchScope
         let threadID: String
@@ -37,6 +89,7 @@ final class ConversationController: NSViewController {
     private var attachmentPreview: AttachmentPreviewController?
     private lazy var findBar = ThreadFindBar(workspace: workspace)
     private let composer = ComposerView()
+    private let liveActivity = ConversationActivityLine()
     private lazy var cloneBanner = ProjectCloneBanner(workspace: workspace)
     private let queuedMessages = QueuedMessagesView()
     private let emptyTitle = label("Connect an environment", size: 26, weight: .semibold)
@@ -45,8 +98,8 @@ final class ConversationController: NSViewController {
     private let requestLabel = label(size: 12, weight: .medium, color: WorkspaceStyle.accent)
     private let noticeLabel = label(size: 12, color: WorkspaceStyle.negative)
     private let activityBadge = Surface(WorkspaceStyle.canvas, border: WorkspaceStyle.outline, radius: 14)
-    private let activityIcon = WorkspaceStyle.icon("circle.dotted", size: 12)
-    private let activityText = label(size: 12, color: WorkspaceStyle.ink)
+    private let activityIcon = WorkspaceStyle.icon("circle.fill", size: 7)
+    private let activityText = label(size: 12, weight: .medium, color: WorkspaceStyle.ink)
     private let activityTime = label(size: 12, color: WorkspaceStyle.secondary)
     private var embeddedActivityStrip: NSView?
     private lazy var terminal = TerminalPanel(workspace: workspace)
@@ -78,23 +131,32 @@ final class ConversationController: NSViewController {
     private lazy var cloud = ActionButton("T3 Connect…", symbol: "globe") { [weak self] in self?.onT3Connect?() }
     private lazy var local = ActionButton("Start Local Server", symbol: "desktopcomputer") { [weak self] in self?.onStartLocal?() }
     private lazy var scratch = ActionButton("Start Without a Project") { [weak self] in self?.perform { try await self?.workspace.startScratch() } }
-    private lazy var earlier = ActionButton("Load Earlier Messages", symbol: "arrow.up") { [weak self] in self?.loadEarlier() }
+    private static let earlierTitle = "Load earlier messages"
+    private lazy var earlier = ActionButton(Self.earlierTitle, style: .capsule) { [weak self] in self?.loadEarlier() }
+    private lazy var history = makeHistoryRow()
     private lazy var review = ActionButton("Review…", style: .subtle) { [weak self] in self?.reviewRequest() }
     private lazy var requestBar = row([requestLabel, NSView(), review])
+    private let approval = ConversationApprovalView()
     private lazy var emptyActions = row([primary, cloud, local, scratch], spacing: 8)
     private let emptyView = NSView()
     private var drafts: [DraftKey: ComposerView.Draft] = [:]
     private var draftKey: DraftKey?
-    private var preparingAttachments = Set<DraftKey>()
+    private var queueEdits: [DraftKey: QueueEdit] = [:]
+    private var preparingAttachments = Set<AttachmentTarget>()
     private var isLoadingHistory = false
     private var pendingMessageJump: MessageJump?
     private var messageJumpTask: Task<Void, Never>?
     private var citationJump: (citation: AssistantCitation, connection: UUID)?
     private var citationJumpTask: Task<Void, Never>?
-    private var latestRequest: (id: String, entry: TimelineEntry?)?
+    private var questionRequest: (id: String, entry: TimelineEntry)?
+    private var approvalTarget: ApprovalTarget?
+    private var submittingApprovals = Set<ApprovalTarget>()
+    private var approvalError: (target: ApprovalTarget, message: String)?
     private var terminalShown = false
     private var startingProjectAction = false
     private var workspaceVisible = true
+    private var activity: Activity?
+    private var activityTimestamp: String?
     private var activityStart: Date?
     private var branchKey: BranchKey?
     private var branchTask: Task<Void, Never>?
@@ -107,7 +169,6 @@ final class ConversationController: NSViewController {
     private var isForking = false
     private var startingSideChat = false
     private var rewindKey: DraftKey?
-    private var queueEditor: QueuedMessageEditor?
     private var questionEditor: QuestionAnswerController?
     private var planSave: ProposedPlanSaveController?
     private var planSaveTarget: ProposedPlan.SaveTarget?
@@ -115,7 +176,7 @@ final class ConversationController: NSViewController {
     private var guestResolutions = Set<String>()
     private var guestExpiry: Date?
     private var guestExpiryTask: Task<Void, Never>?
-    private var queueEditTarget: (scope: QueueScope, runID: String)?
+    private var renderedQueueScope: QueueScope?
     var onPair: (() -> Void)?
     var onT3Connect: (() -> Void)?
     var onStartLocal: (() -> Void)?
@@ -150,6 +211,13 @@ final class ConversationController: NSViewController {
         embedded ? displayedThread.flatMap { workspace.data.projects[$0.projectId] } : workspace.selectedProject
     }
     private var displayedDetail: ThreadDetail { embedded ? workspace.sideChatDetail : workspace.detail }
+    private var queueEdit: QueueEdit? { draftKey.flatMap { queueEdits[$0] } }
+    private var attachmentTarget: AttachmentTarget? {
+        draftKey.map { AttachmentTarget(key: $0, editID: queueEdits[$0]?.id) }
+    }
+    private var canOperateDisplayedThread: Bool {
+        workspace.can("orchestration:operate") && (!embedded || workspace.selectedThread?.archived == false)
+    }
     private var displayedError: String? { embedded ? workspace.sideChatError : workspace.detailError }
     private var displayedCheckout: WorkspaceCheckout { embedded ? .root(branch: displayedThread?.branch) : workspace.draftCheckout }
     private var displayedPath: String? { embedded ? displayedThread.flatMap(workspace.checkoutPath) : workspace.workspacePath }
@@ -191,14 +259,8 @@ final class ConversationController: NSViewController {
         composer.usageLimits.presentationView = view
         let header = makeHeader()
         let body = NSView()
-        body.addSubview(timeline)
-        timeline.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            timeline.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 19),
-            timeline.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -19),
-            timeline.topAnchor.constraint(equalTo: body.topAnchor),
-            timeline.bottomAnchor.constraint(equalTo: body.bottomAnchor),
-        ])
+        timeline.readingColumn = body
+        timeline.isHidden = true
         fill(emptyView, in: body)
         layoutEmptyView()
         body.heightAnchor.constraint(greaterThanOrEqualToConstant: 90).isActive = true
@@ -217,26 +279,31 @@ final class ConversationController: NSViewController {
             guard let self, let environmentID = workspace.environment?.id else { return }
             let key = DraftKey(environmentID: environmentID, selection: .project(id))
             drafts.removeValue(forKey: key)
-            preparingAttachments.remove(key)
+            preparingAttachments.remove(AttachmentTarget(key: key, editID: nil))
             if draftKey == key { composer.load(.init()) }
         }
 
-        let history = row([NSView(), earlier, NSView()])
         let context = row([broughtBack, NSView()])
         broughtBack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         context.isHidden = true
-        let center = column([findBar, history, body, noticeLabel, requestBar, queuedMessages, cloneBanner, context, guestSharingRow,
-                             composer, composerStatus, terminal],
+        let center = column([findBar, history, body, liveActivity, noticeLabel, requestBar, approval, queuedMessages, cloneBanner,
+                             context, guestSharingRow, composer, composerStatus, terminal],
                             spacing: 6, alignment: .width)
         let centered = NSView()
         centered.addSubview(center)
+        centered.addSubview(timeline)
         center.translatesAutoresizingMaskIntoConstraints = false
+        timeline.translatesAutoresizingMaskIntoConstraints = false
         let preferredWidth = center.widthAnchor.constraint(equalTo: centered.widthAnchor, multiplier: embedded ? 1 : 0.80,
                                                            constant: embedded ? -22 : 0)
         preferredWidth.priority = .defaultHigh
         let minimumWidth = center.widthAnchor.constraint(greaterThanOrEqualToConstant: 350)
         minimumWidth.priority = NSLayoutConstraint.Priority(751)
         NSLayoutConstraint.activate([
+            timeline.leadingAnchor.constraint(equalTo: centered.leadingAnchor),
+            timeline.trailingAnchor.constraint(equalTo: centered.trailingAnchor),
+            timeline.topAnchor.constraint(equalTo: body.topAnchor),
+            timeline.bottomAnchor.constraint(equalTo: body.bottomAnchor),
             preferredWidth,
             minimumWidth,
             center.widthAnchor.constraint(lessThanOrEqualTo: centered.widthAnchor, constant: -26),
@@ -249,9 +316,19 @@ final class ConversationController: NSViewController {
         fill(layout, in: view)
         composer.onDraftChange = { [weak self] draft in
             guard let self, let draftKey else { return }
-            drafts[draftKey] = draft
+            if let edit = queueEdits[draftKey] {
+                queueEdits[draftKey]?.draft = draft
+                if edit.error != nil {
+                    queueEdits[draftKey]?.error = nil
+                    renderQueue()
+                }
+            } else {
+                drafts[draftKey] = draft
+            }
         }
         composer.onSend = { [weak self] draft in self?.send(draft) }
+        composer.onSaveQueuedEdit = { [weak self] draft in self?.saveQueueEdit(draft) }
+        composer.onCancelQueuedEdit = { [weak self] in self?.cancelQueueEdit() }
         composer.onWorktree = { [weak self] in self?.chooseWorktree() }
         composer.onRootCheckout = { [weak self] in self?.workspace.setDraftCheckout(.root()) }
         composer.onBranch = { [weak self] in self?.showBranches() }
@@ -267,10 +344,10 @@ final class ConversationController: NSViewController {
         }
         composer.onVoiceSettings = { [weak self] in self?.onVoiceSettings?() }
         composer.onReadAttachment = { [weak self] pasteboard in
-            guard let self, let key = draftKey else { return false }
+            guard let self, composer.canManageAttachments, let target = attachmentTarget else { return false }
             let inputs = AttachmentInput.read(pasteboard)
             guard !inputs.isEmpty else { return false }
-            prepareAttachments(inputs, for: key)
+            prepareAttachments(inputs, for: target)
             return true
         }
         composer.onModelChange = { [weak self] in self?.render(.providers) }
@@ -279,6 +356,10 @@ final class ConversationController: NSViewController {
         composer.onEditQueued = { [weak self] in self?.editLastQueuedMessage() ?? false }
         composer.goalBar.onAction = { [weak self] action in self?.runGoalAction(action) }
         composer.usageLimits.onViewAll = { [weak self] in self?.onShowUsageLimits?() }
+        composer.usageLimits.onOpen = { [weak workspace] in
+            guard let workspace else { return }
+            Task { try? await workspace.usageLimitRefresh.run(automatic: true) }
+        }
         composer.loadCommandCatalog = { [workspace] scope in try await workspace.composerCommands(for: scope) }
         queuedMessages.onAction = { [weak self] action in self?.handleQueueAction(action) }
         findBar.onReveal = { [weak self] match, query in
@@ -315,6 +396,7 @@ final class ConversationController: NSViewController {
         activityText.setContentCompressionResistancePriority(.required, for: .horizontal)
         activityTime.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         activityTime.setContentCompressionResistancePriority(.required, for: .horizontal)
+        activityTime.isHidden = true
         stopButton.widthAnchor.constraint(equalToConstant: 23).isActive = true
         stopButton.heightAnchor.constraint(equalToConstant: 23).isActive = true
         activityBadge.addSubview(activity)
@@ -363,6 +445,7 @@ final class ConversationController: NSViewController {
         let selection = displayedSelection
         let thread = displayedThread
         let project = displayedProject
+        let canOperate = canOperateDisplayedThread
         let nativeSubagent = thread?.isProviderNativeSubagent == true
         let key = workspace.environment.flatMap { environment in selection.map { DraftKey(environmentID: environment.id, selection: $0) } }
         let changedThread = draftKey != key
@@ -370,17 +453,14 @@ final class ConversationController: NSViewController {
             workspace.voiceInput.cancel(owner: voiceOwner)
             composer.goalBar.closeDetails()
             draftKey = key
-            composer.load(key.flatMap { drafts[$0] } ?? .init())
-            composer.setPreparingAttachments(key.map(preparingAttachments.contains) ?? false)
+            loadComposerDraft()
             timeline.reset()
             isLoadingHistory = false
         }
         if changedThread || !change.intersection([.selection, .connection, .sidebar, .providers]).isEmpty {
             let ready = workspace.connection == .ready
-            let canOperate = workspace.can("orchestration:operate") && (!embedded || workspace.selectedThread?.archived == false)
             titleField.stringValue = thread?.title ?? (project == nil ? "T3 Code" : "New thread")
             titleField.toolTip = thread?.title
-            updateActivity(thread, canOperate: canOperate)
             if !embedded {
                 subscribeBranch(ready: ready)
                 updateContext()
@@ -415,7 +495,6 @@ final class ConversationController: NSViewController {
         timeline.citationEnvironmentID = workspace.currentServerID
         let guestShare = displayedDetail.guestShare
         renderGuestShare(guestShare)
-        renderVoice()
         timeline.setAttachmentScope(workspace.attachmentScope)
         let hasHistory = thread != nil && entries.contains(where: \.isMessage)
         composer.setCommandContext(connection: workspace.connectionID, cwd: displayedPath,
@@ -424,20 +503,21 @@ final class ConversationController: NSViewController {
         let fileContext = workspace.can("filesystem:read") ? displayedFileContext : nil
         if changedThread || fileContext != timeline.fileContext ||
             !change.intersection([.timeline, .selection, .providers, .connection, embedded ? .sideChat : []]).isEmpty {
-            timeline.render(entries, runModels: displayedDetail.runModels,
+            timeline.render(entries, runModels: displayedDetail.runModels, activeRunIDs: displayedDetail.activeRunIDs,
                             providers: workspace.providers, workspacePath: displayedPath, fileContext: fileContext,
                             guestShare: guestShare, canResolveGuestMessages: displayedGuestTarget != nil && workspace.can("orchestration:operate"),
                             busyGuestMessages: guestResolutions)
         }
         timeline.isHidden = !timeline.hasContent
         emptyView.isHidden = !timeline.isHidden
-        earlier.superview?.isHidden = displayedDetail.historyCursor == nil
-        earlier.isEnabled = !isLoadingHistory
+        renderHistory()
         let error = displayedError ?? thread?.lastError
         noticeLabel.isHidden = error == nil
         noticeLabel.stringValue = error ?? ""
-        renderRequest(entries)
+        let pendingRequests = renderRequest(entries)
+        updateActivity(thread, pending: pendingRequests, entries: entries, canOperate: canOperate)
         renderQueue()
+        renderVoice()
         renderGoal(thread)
         let activeModel = thread?.activeRunId.map { displayedDetail.queue.activeModel(for: $0) }
         composer.renderModelSwitch(activeModel: activeModel ?? .null, canSwitch: displayedSwitchDelivery != nil)
@@ -509,19 +589,63 @@ final class ConversationController: NSViewController {
         }
     }
 
-    private func updateActivity(_ thread: ThreadSummary?, canOperate: Bool) {
-        let working = thread?.isWorking == true
-        let waiting = (thread?.pendingRequest ?? .null) != .null
-        activityBadge.isHidden = !working && !waiting
+    private func updateActivity(_ thread: ThreadSummary?, pending: [Wire], entries: [TimelineEntry], canOperate: Bool) {
+        let next: Activity? = thread.map { thread in
+            guard workspace.connection == .ready else { return .offline }
+            if thread.archived { return .archived }
+            if thread.isWorking && thread.stopRequested { return .stopping }
+            let blocking = pending.first { $0["responseCapability"]["type"].string != "message" }
+            let shellRequest = thread.pendingRequest
+            let shellKind: String? = {
+                guard let id = shellRequest["id"].string, shellRequest["blocking"].bool != false,
+                      !displayedDetail.loaded || entries.contains(where: { $0.id == id &&
+                          ($0.type == "secret_request" || $0.type == "link_request") }) else { return nil }
+                return shellRequest["kind"].string
+            }()
+            if let kind = blocking?["kind"].string ?? shellKind {
+                return kind == "user_input" ? .question : .approval
+            }
+            if thread.isWorking {
+                switch thread.status {
+                case "queued": return .queued
+                case "preparing", "starting": return .starting
+                case "waiting": return .waiting
+                default: return .working
+                }
+            }
+            if thread.isWaitingForBackgroundWork { return .background }
+            return thread.status == "failed" ? .failed : .idle
+        }
+        activityBadge.isHidden = next == nil
         embeddedActivityStrip?.isHidden = activityBadge.isHidden
-        activityIcon.contentTintColor = waiting ? WorkspaceStyle.accent : WorkspaceStyle.secondary
-        activityText.stringValue = waiting ? "Needs input" : thread?.status == "queued" ? "Queued" : "Working"
-        stopButton.isEnabled = canOperate && working
-        stopButton.isHidden = !working
-        let start = working ? WorkspaceStyle.date(thread?.activeSince) : nil
-        activityTime.isHidden = start == nil
-        activityStart = start
-        refreshActivityTime()
+        if activity != next {
+            activity = next
+            activityIcon.contentTintColor = next?.tint
+            activityText.textColor = next?.tint
+            activityText.stringValue = next?.title ?? ""
+        }
+        let live: ThreadLiveActivity? = switch next {
+        case .queued: .init(symbol: "clock", title: "Queued to start…")
+        case .starting: .init(symbol: "ellipsis", title: "Starting…")
+        case .working:
+            displayedDetail.liveActivity(for: thread?.activeRunId ?? thread?.latestRunID) ??
+                .init(symbol: "ellipsis", title: "Working…")
+        case .waiting: .init(symbol: "clock", title: "Waiting to continue…")
+        case .stopping: .init(symbol: "stop", title: "Stopping…")
+        case .background: .init(symbol: "clock", title: "Waiting for background tasks…")
+        default: nil
+        }
+        liveActivity.render(live)
+        let canStop = canOperate && thread?.isWorking == true && thread?.archived == false
+        stopButton.isHidden = !canStop
+        stopButton.isEnabled = canStop && next != .stopping
+        let timestamp = next == .starting || next == .working || next == .stopping ? thread?.activeSince : nil
+        if activityTimestamp != timestamp {
+            activityTimestamp = timestamp
+            activityStart = WorkspaceStyle.date(timestamp)
+            activityTime.isHidden = activityStart == nil
+            refreshActivityTime()
+        }
     }
 
     func refreshActivityTime() {
@@ -670,7 +794,8 @@ final class ConversationController: NSViewController {
     var canStepFind: Bool { findBar.canNavigate }
 
     private var voiceAvailable: Bool {
-        workspaceVisible && displayedSelection != nil && !composer.isHidden && composer.canDictate && workspace.voiceTarget != nil
+        workspaceVisible && displayedSelection != nil && queueEdit == nil && !composer.isHidden &&
+            composer.canDictate && workspace.voiceTarget != nil
     }
 
     var canToggleDictation: Bool {
@@ -930,7 +1055,7 @@ final class ConversationController: NSViewController {
 
     private var canRewindSelected: Bool {
         guard !embedded, let thread = displayedThread else { return false }
-        return rewindKey == nil && queueEditor == nil && workspace.supportsRewind && workspace.can("orchestration:operate") &&
+        return rewindKey == nil && queueEdit == nil && workspace.supportsRewind && workspace.can("orchestration:operate") &&
             !thread.archived && !thread.isWorking && !workspace.sending.contains(.thread(thread.id)) &&
             displayedDetail.requests.isEmpty
     }
@@ -1023,7 +1148,9 @@ final class ConversationController: NSViewController {
 
     func forgetSideChatDraft(_ reference: SideChatReference) {
         guard embedded else { return }
-        drafts.removeValue(forKey: DraftKey(environmentID: reference.environmentID, selection: .thread(reference.threadID)))
+        let key = DraftKey(environmentID: reference.environmentID, selection: .thread(reference.threadID))
+        drafts.removeValue(forKey: key)
+        queueEdits.removeValue(forKey: key)
     }
 
     func startSideChat() { startSideChat(prompt: "", submitted: nil) }
@@ -1083,7 +1210,7 @@ final class ConversationController: NSViewController {
     }
 
     private func send(_ draft: ComposerView.Draft) {
-        guard let key = draftKey else { return }
+        guard let key = draftKey, queueEdit == nil else { return }
         if let prompt = SideChatCommand.prompt(in: draft.text) {
             guard !draft.hasAttachments, !draft.retainedContextRecords.contains(where: { $0["kind"].string == "terminal" }) else {
                 onError?("Remove attachments and terminal selections before sending a side chat prompt.")
@@ -1102,7 +1229,7 @@ final class ConversationController: NSViewController {
         perform {
             try await self.workspace.send(intent)
             self.drafts.removeValue(forKey: key)
-            if self.draftKey == key {
+            if self.draftKey == key, self.queueEdit == nil {
                 self.composer.load(.init(model: draft.model))
                 self.render(.selection)
                 self.focusComposer()
@@ -1153,7 +1280,7 @@ final class ConversationController: NSViewController {
     }
 
     var canSendNextQueuedMessage: Bool {
-        guard queueScope != nil, !queueBusy, queueEditor == nil else { return false }
+        guard queueScope != nil, !queueBusy, queueEdit == nil else { return false }
         let state = displayedDetail.queue.state
         return state.messages.first.flatMap { state.delivery(for: $0) } != nil
     }
@@ -1170,16 +1297,28 @@ final class ConversationController: NSViewController {
     }
 
     private var queueEditAllowed: Bool {
-        !queueBusy && queueEditor == nil &&
+        !queueBusy && queueEdit == nil && !startingSideChat && rewindKey == nil && canOperateDisplayedThread && !composer.isHidden &&
+            displayedSelection.map { !workspace.sending.contains($0) } == true &&
             !displayedDetail.requests.values.contains { $0["kind"].string == "user_input" }
     }
 
     private func renderQueue() {
         let state = displayedThread != nil ? displayedDetail.queue.state : .init()
         let scope = queueScope
-        queuedMessages.render(state, canOperate: scope != nil, canEdit: queueEditAllowed, busy: queueBusy || queueEditor != nil)
-        if let target = queueEditTarget {
-            queueEditor?.setAvailable(target.scope == scope && state.messages.contains { $0.id == target.runID && $0.editable })
+        if renderedQueueScope != scope {
+            queuedMessages.invalidateDrag()
+            renderedQueueScope = scope
+        }
+        let edit = queueEdit
+        queuedMessages.render(state, canOperate: scope != nil, canEdit: queueEditAllowed, busy: queueBusy || edit != nil)
+        if let edit {
+            let available = edit.scope == scope && canOperateDisplayedThread &&
+                state.messages.contains { $0.id == edit.runID && $0.editable }
+            if edit.saving { composer.renderQueueEdit(.saving) }
+            else if !available { composer.renderQueueEdit(.unavailable) }
+            else { composer.renderQueueEdit(edit.error.map(ComposerView.QueueEditState.failed) ?? .editing) }
+        } else {
+            composer.renderQueueEdit(nil)
         }
     }
 
@@ -1187,11 +1326,11 @@ final class ConversationController: NSViewController {
         guard let scope = queueScope, queueEditAllowed, let last = displayedDetail.queue.state.messages.last, last.editable else {
             return false
         }
-        return openQueueEditor(last, scope: scope)
+        return beginQueueEdit(last, scope: scope)
     }
 
     private func handleQueueAction(_ action: QueuedMessagesView.Action) {
-        guard let scope = queueScope, !queueBusy, queueEditor == nil else { return }
+        guard let scope = queueScope, !queueBusy, queueEdit == nil else { return }
         let state = displayedDetail.queue.state
         switch action {
         case .resume:
@@ -1207,10 +1346,16 @@ final class ConversationController: NSViewController {
             }
         case .edit(let runID):
             guard queueEditAllowed, let message = state.messages.first(where: { $0.id == runID && $0.editable }) else { return }
-            _ = openQueueEditor(message, scope: scope)
+            _ = beginQueueEdit(message, scope: scope)
         case .remove(let runID):
             guard state.messages.contains(where: { $0.id == runID }) else { return }
             runQueueCommand("queued-run.cancel", scope: scope, fields: ["runId": .string(runID)])
+        case .reorder(let move):
+            guard state.messages.contains(where: { $0.id == move.runID }),
+                  move.beforeRunID.map({ before in state.messages.contains { $0.id == before } }) ?? true else { return }
+            runQueueCommand("queued-run.reorder", scope: scope, fields: [
+                "runId": .string(move.runID), "beforeRunId": move.beforeRunID.map(Wire.string) ?? .null,
+            ])
         }
     }
 
@@ -1224,32 +1369,103 @@ final class ConversationController: NSViewController {
         }
     }
 
-    private func openQueueEditor(_ message: QueuedMessage, scope: QueueScope) -> Bool {
-        guard let window = view.window, window.attachedSheet == nil else { return false }
-        let clipboardSource = workspace.currentServerID.map { TerminalContextClipboard.Source(environmentID: $0, threadID: scope.threadID) }
-        let editor = QueuedMessageEditor(message: message, terminalClipboardSource: clipboardSource)
-        queueEditor = editor
-        queueEditTarget = (scope, message.id)
-        editor.onSubmit = { [workspace] attempt in
-            try await workspace.editQueuedMessage(attempt, threadID: scope.threadID, runID: message.id, connection: scope.connection)
-        }
-        editor.onClose = { [weak self] in
-            guard let self else { return }
-            queueEditTarget = nil
-            queueEditor = nil
-            renderQueue()
-            focusComposer()
-        }
-        editor.present(in: window)
+    private func loadComposerDraft() {
+        let draft = draftKey.flatMap { queueEdits[$0]?.draft ?? drafts[$0] }
+        composer.load(draft ?? .init())
+        composer.setPreparingAttachments(attachmentTarget.map(preparingAttachments.contains) ?? false)
+    }
+
+    private func beginQueueEdit(_ message: QueuedMessage, scope: QueueScope) -> Bool {
+        guard let key = draftKey, let window = view.window, window.attachedSheet == nil else { return false }
+        drafts[key] = composer.currentDraft
+        let draft = ComposerView.Draft(text: message.displayText, retainedAttachments: message.attachments,
+                                       retainedContextRecords: message.context["records"].array)
+        queueEdits[key] = QueueEdit(scope: scope, runID: message.id, originalAttachments: message.attachments, draft: draft)
+        loadComposerDraft()
+        render(.selection)
+        composer.focusAtEnd()
         return true
     }
 
+    private func cancelQueueEdit() {
+        guard let key = draftKey, let edit = queueEdits[key], !edit.saving else { return }
+        finishQueueEdit(for: key, id: edit.id)
+    }
+
+    private func finishQueueEdit(for key: DraftKey, id: UUID) {
+        guard queueEdits[key]?.id == id else { return }
+        queueEdits.removeValue(forKey: key)
+        guard draftKey == key else { return }
+        loadComposerDraft()
+        render(.selection)
+        composer.focusAtEnd()
+    }
+
+    private func saveQueueEdit(_ draft: ComposerView.Draft) {
+        guard let key = draftKey, var edit = queueEdits[key], !edit.saving, edit.scope == queueScope, canOperateDisplayedThread,
+              let target = attachmentTarget, !preparingAttachments.contains(target),
+              displayedDetail.queue.state.messages.contains(where: { $0.id == edit.runID && $0.editable }) else { return }
+        let text = draft.outgoingText
+        guard !text.isEmpty else { return }
+        let retained = draft.retainedAttachments == edit.originalAttachments && draft.attachments.isEmpty ? nil : draft.retainedAttachments
+        let content = Workspace.QueueEditContent(text: text, retained: retained, files: draft.attachments,
+                                                 terminalContextRecords: draft.retainedContextRecords.filter { $0["kind"].string == "terminal" })
+        let attempt = edit.attempt.flatMap { $0.content == content ? $0 : nil } ?? .init(content: content)
+        edit.attempt = attempt
+        edit.saving = true
+        edit.error = nil
+        queueEdits[key] = edit
+        renderQueue()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await workspace.editQueuedMessage(attempt, threadID: edit.scope.threadID, runID: edit.runID, connection: edit.scope.connection)
+                finishQueueEdit(for: key, id: edit.id)
+            } catch {
+                guard queueEdits[key]?.id == edit.id else { return }
+                queueEdits[key]?.saving = false
+                queueEdits[key]?.error = error.localizedDescription
+                if draftKey == key { renderQueue() }
+            }
+        }
+    }
+
+    private func makeHistoryRow() -> NSView {
+        earlier.image = WorkspaceStyle.symbol("chevron.up", size: 10, weight: .semibold)
+        earlier.imagePosition = .imageLeading
+        earlier.widthAnchor.constraint(greaterThanOrEqualToConstant: 172).isActive = true
+        earlier.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        let rules = (0..<2).map { _ in
+            let line = Surface(WorkspaceStyle.line)
+            line.widthAnchor.constraint(equalToConstant: 30).isActive = true
+            line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            line.setAccessibilityElement(false)
+            return line
+        }
+        let bar = row([rules[0], earlier, rules[1]], spacing: 11)
+        return column([bar], spacing: 0, alignment: .centerX)
+    }
+
+    private func renderHistory() {
+        history.isHidden = displayedDetail.historyCursor == nil
+        earlier.isEnabled = !isLoadingHistory
+        let title = isLoadingHistory ? "Loading messages…" : Self.earlierTitle
+        if earlier.title != title {
+            earlier.title = title
+            earlier.contentTintColor = isLoadingHistory ? WorkspaceStyle.ink : WorkspaceStyle.secondary
+            earlier.setAccessibilityLabel(isLoadingHistory ? "Loading earlier messages" : title)
+        }
+    }
+
     private func loadEarlier() {
-        guard !isLoadingHistory else { return }
+        guard !isLoadingHistory, displayedDetail.historyCursor != nil else { return }
         isLoadingHistory = true
-        earlier.isEnabled = false
+        renderHistory()
         perform {
-            defer { self.isLoadingHistory = false; self.earlier.isEnabled = true }
+            defer {
+                self.isLoadingHistory = false
+                self.renderHistory()
+            }
             try await self.workspace.loadEarlier(inSideChat: self.embedded)
         }
     }
@@ -1324,40 +1540,52 @@ final class ConversationController: NSViewController {
     }
 
     private func chooseAttachments() {
-        guard let window = view.window, let key = draftKey else { return }
+        guard composer.canAttachFiles, let window = view.window, let target = attachmentTarget else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         panel.prompt = "Attach Files"
         panel.beginSheetModal(for: window) { [weak self] result in
-            if result == .OK { self?.prepareAttachments(panel.urls.map(AttachmentInput.file), for: key) }
+            if result == .OK { self?.prepareAttachments(panel.urls.map(AttachmentInput.file), for: target) }
         }
     }
 
-    private func prepareAttachments(_ inputs: [AttachmentInput], for key: DraftKey) {
-        guard preparingAttachments.insert(key).inserted else {
+    private func prepareAttachments(_ inputs: [AttachmentInput], for target: AttachmentTarget) {
+        guard target.editID == nil || queueEdits[target.key]?.id == target.editID else { return }
+        guard preparingAttachments.insert(target).inserted else {
             onError?("Wait for the current attachments to finish preparing.")
             return
         }
-        if draftKey == key { composer.setPreparingAttachments(true) }
+        if attachmentTarget == target { composer.setPreparingAttachments(true) }
         Task { [weak self] in
             defer {
                 if let self {
-                    preparingAttachments.remove(key)
-                    if draftKey == key { composer.setPreparingAttachments(false) }
+                    preparingAttachments.remove(target)
+                    if attachmentTarget == target { composer.setPreparingAttachments(false) }
                 }
             }
             do {
                 let files = try await AttachmentInput.prepare(inputs)
-                guard let self, preparingAttachments.contains(key) else { return }
-                if draftKey == key { try composer.addAttachments(files) }
-                else {
-                    var draft = drafts[key] ?? .init()
+                guard let self, preparingAttachments.contains(target) else { return }
+                if attachmentTarget == target { try composer.addAttachments(files) }
+                else if let editID = target.editID {
+                    if queueEdits[target.key]?.id == editID { try queueEdits[target.key]?.draft.addAttachments(files) }
+                } else {
+                    var draft = drafts[target.key] ?? .init()
                     try draft.addAttachments(files)
-                    drafts[key] = draft
+                    drafts[target.key] = draft
                 }
-            } catch { self?.onError?(error.localizedDescription) }
+            } catch {
+                guard let self else { return }
+                if let editID = target.editID {
+                    guard queueEdits[target.key]?.id == editID else { return }
+                    queueEdits[target.key]?.error = error.localizedDescription
+                    if draftKey == target.key { renderQueue() }
+                } else {
+                    onError?(error.localizedDescription)
+                }
+            }
         }
     }
 
@@ -1510,18 +1738,66 @@ final class ConversationController: NSViewController {
         if let args = item.representedObject as? [String], args.count == 2 { onThreadAction?(args[0], args[1]) }
     }
 
-    private func renderRequest(_ entries: [TimelineEntry]) {
+    @discardableResult
+    private func renderRequest(_ entries: [TimelineEntry]) -> [Wire] {
         if let questionEditor { questionEditor.setAvailable(workspace.canAnswerQuestion(questionEditor.target)) }
-        let pending = displayedDetail.requests.values.filter { value in
-            ["command", "file-read", "file-change", "mcp-elicitation", "permission", "user_input"].contains(value["kind"].string ?? "")
-        }.sorted { ($0["createdAt"].string ?? "") < ($1["createdAt"].string ?? "") }
-        let id = pending.first?["id"].string
-        timeline.setAppAwaitingUser(id != nil)
-        latestRequest = id.map { id in (id, entries.last { $0.requestId == id }) }
-        requestBar.isHidden = id == nil
-        requestLabel.stringValue = pending.count > 1 ? "\(pending.count) requests need your attention" :
-            pending.first?["kind"].string == "user_input" ? "The agent has a question" : "The agent is requesting approval"
-        review.isEnabled = workspace.can("orchestration:operate") && latestRequest?.entry != nil
+        let requests = displayedDetail.requests
+        let pending = requests.values.filter {
+            ["command", "file-read", "file-change", "mcp-elicitation", "permission", "user_input"].contains($0["kind"].string ?? "")
+        }.sorted { left, right in
+            let leftAsync = left["responseCapability"]["type"].string == "message"
+            let rightAsync = right["responseCapability"]["type"].string == "message"
+            if leftAsync != rightAsync { return !leftAsync }
+            return (left["createdAt"].string ?? "", left["id"].string ?? "") <
+                (right["createdAt"].string ?? "", right["id"].string ?? "")
+        }
+        let threadID = displayedThread?.id
+        let connection = workspace.connectionID
+        if !submittingApprovals.isEmpty {
+            submittingApprovals = submittingApprovals.filter { target in
+                target.connection == connection &&
+                    (target.threadID != threadID || !displayedDetail.loaded || requests[target.requestID] != nil)
+            }
+        }
+        timeline.setAppAwaitingUser(!pending.isEmpty)
+        let first = pending.first
+        let id = first?["id"].string
+        let isQuestion = first?["kind"].string == "user_input"
+        requestBar.isHidden = !isQuestion
+        questionRequest = nil
+        if isQuestion, let id, let entry = entries.last(where: { $0.requestId == id && $0.type == "user_input_request" }) {
+            questionRequest = (id, entry)
+        }
+        if isQuestion {
+            requestLabel.stringValue = pending.count > 1 ? "\(pending.count) requests need your attention" : "The agent has a question"
+            review.isEnabled = canOperateDisplayedThread && questionRequest != nil
+        }
+        guard !isQuestion, let id, let kind = first?["kind"].string else {
+            approvalTarget = nil
+            approvalError = nil
+            approval.render(nil, pendingCount: 0, notice: "", error: false, respond: nil)
+            return pending
+        }
+        let entry = entries.last { $0.requestId == id && $0.type == "approval_request" }
+        let capability = first?["responseCapability"] ?? .null
+        let resumable = capability["type"].string == "live"
+        let scope = threadID.flatMap { threadID in connection.map { ApprovalTarget(threadID: threadID, requestID: id, connection: $0) } }
+        let target = resumable && entry != nil && canOperateDisplayedThread && displayedThread?.archived == false ? scope : nil
+        if approvalError?.target != scope { approvalError = nil }
+        approvalTarget = target
+        let busy = scope.map(submittingApprovals.contains) ?? false
+        let message: String
+        if busy { message = "Sending decision…" }
+        else if let approvalError { message = approvalError.message }
+        else if !resumable { message = capability["reason"].string ?? "Approval is no longer available." }
+        else if entry == nil { message = "Loading request details…" }
+        else if target == nil { message = "Approval is unavailable on this connection." }
+        else { message = "" }
+        approval.render(.init(kind: kind, entry: entry), pendingCount: pending.count, notice: message, error: approvalError != nil,
+                        respond: busy ? nil : target.map { target in
+                            { [weak self] decision in self?.respondToApproval(decision, target: target) }
+                        })
+        return pending
     }
 
     private func sendAppMessage(_ text: String, conversation: String, scope: AttachmentScope) async throws {
@@ -1534,29 +1810,31 @@ final class ConversationController: NSViewController {
     }
 
     private func reviewRequest() {
-        guard let window = view.window, let request = latestRequest, let entry = request.entry,
+        guard let window = view.window, let request = questionRequest,
               let thread = displayedThread else { return }
-        if entry.type == "user_input_request" {
-            reviewQuestions(entry, requestID: request.id, threadID: thread.id, window: window)
-            return
-        }
-        let alert = NSAlert()
-        alert.messageText = entry.value["title"].string ?? "Approval requested"
-        alert.informativeText = String((entry.value["prompt"].string ?? entry.value["reason"].string ?? "Review this provider request.").prefix(1_800))
-        let supplied = entry.value["options"].array.compactMap { option -> (String, String)? in
-            guard let label = option["label"].string, let decision = option["decision"].string else { return nil }
-            return (label, decision)
-        }
-        let options = supplied.isEmpty ? [("Allow Once", "accept"), ("Decline", "decline")] : supplied
-        alert.addButton(withTitle: "Cancel").keyEquivalent = "\r"
-        for (label, _) in options { alert.addButton(withTitle: label) }
-        alert.beginSheetModal(for: window) { [weak self] result in
-            let index = result.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue - 1
-            guard let self, options.indices.contains(index) else { return }
-            perform {
-                try await self.workspace.dispatch("runtime-request.respond", threadId: thread.id, [
-                    "requestId": .string(request.id), "decision": .string(options[index].1),
+        reviewQuestions(request.entry, requestID: request.id, threadID: thread.id, window: window)
+    }
+
+    private func respondToApproval(_ decision: String, target: ApprovalTarget) {
+        guard approvalTarget == target, submittingApprovals.insert(target).inserted else { return }
+        approvalError = nil
+        renderRequest(displayedDetail.timeline)
+        Task {
+            guard approvalTarget == target, workspace.connectionID == target.connection,
+                  displayedThread?.id == target.threadID, canOperateDisplayedThread,
+                  displayedDetail.requests[target.requestID]?["responseCapability"]["type"].string == "live" else {
+                submittingApprovals.remove(target)
+                renderRequest(displayedDetail.timeline)
+                return
+            }
+            do {
+                try await workspace.dispatch("runtime-request.respond", threadId: target.threadID, [
+                    "requestId": .string(target.requestID), "decision": .string(decision),
                 ])
+            } catch {
+                submittingApprovals.remove(target)
+                if approvalTarget == target { approvalError = (target, error.localizedDescription) }
+                renderRequest(displayedDetail.timeline)
             }
         }
     }

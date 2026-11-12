@@ -145,9 +145,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         return true
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) { notifications.clearBackground() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        notifications.clearBackground()
+        syncProviderUsageActivity()
+    }
 
-    func windowDidBecomeKey(_ notification: Notification) { notifications.clearBackground() }
+    func applicationDidResignActive(_ notification: Notification) {
+        workspace.updateProviderUsageActivity(active: false)
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        notifications.clearBackground()
+        syncProviderUsageActivity()
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) { syncProviderUsageActivity() }
+
+    private func syncProviderUsageActivity() {
+        workspace.updateProviderUsageActivity(active: NSApp.isActive && window?.occlusionState.contains(.visible) == true)
+    }
 
     private func makeWindow() {
         let tools = NSSplitViewItem(viewController: rail)

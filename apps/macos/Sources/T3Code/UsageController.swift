@@ -48,7 +48,6 @@ final class UsageController: NSViewController {
     private var historyTask: Task<Void, Never>?
     private var limitsTask: Task<Void, Never>?
     private var readHistoryAt: ContinuousClock.Instant?
-    private var refreshedLimitsAt: ContinuousClock.Instant?
     var onBack: (() -> Void)?
     var onManageHubs: (() -> Void)?
 
@@ -134,15 +133,14 @@ final class UsageController: NSViewController {
             resetResult = nil
             redeeming = nil
             readHistoryAt = nil
-            refreshedLimitsAt = nil
         }
         if modelFilter != workspace.usageModelFilter {
             modelFilter = workspace.usageModelFilter
             invalidateHistory()
         }
         if metric == .limits {
-            if limitsError == nil, (refreshedLimitsAt?.duration(to: .now) ?? .seconds(300)) >= .seconds(300) {
-                refreshLimits()
+            if !configurationOnly, limitsError == nil {
+                refreshLimits(automatic: true)
             }
         } else if historyError == nil, (readHistoryAt?.duration(to: .now) ?? .seconds(60)) >= .seconds(60) {
             readHistory()
@@ -228,18 +226,17 @@ final class UsageController: NSViewController {
         }
     }
 
-    private func refreshLimits() {
+    private func refreshLimits(automatic: Bool = false) {
         guard limitsTask == nil, let connection, workspace.can("orchestration:read") else { return }
         limitsError = nil
         limitsTask = Task { [weak self] in
             guard let self else { return }
-            do { _ = try await workspace.request("server.refreshProviders", ["workspaceSnapshotsOnDemand": .bool(true)]) }
+            do { try await workspace.usageLimitRefresh.run(automatic: automatic) }
             catch {
                 guard !Task.isCancelled, workspace.connectionID == connection else { return }
                 limitsError = error.localizedDescription
             }
             guard !Task.isCancelled, workspace.connectionID == connection else { return }
-            refreshedLimitsAt = .now
             limitsTask = nil
             if metric == .limits { render() }
         }

@@ -111,7 +111,8 @@ final class ComposerOptionsView: NSStackView {
     }
 
     private var extraOptions: [ComposerModelOption] {
-        model.descriptors.filter { $0.id != model.reasoning?.id && $0.id != model.speed?.id }
+        let ultracode = promptEffort ? nil : model.ultracodeToggle?.id
+        return model.descriptors.filter { $0.id != model.reasoning?.id && $0.id != model.speed?.id && $0.id != ultracode }
     }
 
     private func isPromptControlled(_ option: ComposerModelOption) -> Bool {
@@ -134,7 +135,7 @@ final class ComposerOptionsView: NSStackView {
         readout.toolTip = locked ? "Ultrathink is set by your prompt." : option.description
         readout.isEnabled = enabled && (!locked || !extraOptions.isEmpty)
 
-        let levels = option.effortLevels
+        let levels = model.effortLevels(for: option)
         slider.isHidden = locked || levels.count < 2
         guard !slider.isHidden else { return }
         let lit = model.effortDots(for: option)?.lit ?? 0
@@ -181,7 +182,7 @@ final class ComposerOptionsView: NSStackView {
 
     @objc private func pickEffort(_ sender: NSSlider) {
         guard enabled, let option = model.reasoning, !isPromptControlled(option) else { return }
-        let levels = option.effortLevels
+        let levels = model.effortLevels(for: option)
         let index = sender.integerValue
         guard levels.indices.contains(index) else { return }
         onPick?(option.id, levels[index].value)
@@ -194,7 +195,8 @@ final class ComposerOptionsView: NSStackView {
         menu.addItem(choice("Use Provider Default", option: option, value: nil, selected: override == nil,
                             description: option.description))
         menu.addItem(.separator())
-        for candidate in option.choices {
+        let choices = isPromptControlled(option) ? option.choices : model.choices(for: option)
+        for candidate in choices {
             menu.addItem(choice(candidate.title, option: option, value: candidate.value,
                                 selected: override == candidate.value, description: candidate.description))
         }

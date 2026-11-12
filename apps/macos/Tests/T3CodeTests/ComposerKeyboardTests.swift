@@ -153,6 +153,24 @@ struct ComposerKeyboardTests {
         #expect(sent.first?.freshContext == true)
     }
 
+    @Test func returnSavesAnEditedQueuePromptThatLooksLikeALocalCommand() throws {
+        let (window, composer, editor) = try composerWindow()
+        composer.setCommandContext(connection: nil, cwd: nil, freshSession: true)
+        composer.renderQueueEdit(.editing)
+        var sent: [String] = []
+        var saved: [String] = []
+        composer.onSend = { sent.append($0.text) }
+        composer.onSaveQueuedEdit = { saved.append($0.text) }
+        editor.insertText("/clear", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+
+        editor.keyDown(with: try returnEvent(window: window))
+
+        #expect(saved == ["/clear"])
+        #expect(sent.isEmpty)
+        #expect(editor.string == "/clear")
+        #expect(!composer.currentDraft.freshContext)
+    }
+
     private func composerWindow() throws -> (NSWindow, ComposerView, NSTextView) {
         _ = NSApplication.shared
         let frame = NSRect(x: 0, y: 0, width: 630, height: 150)

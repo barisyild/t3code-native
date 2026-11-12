@@ -5,6 +5,7 @@ enum WorkspaceStyle {
     static let canvas = color(0x000000, 0xFFFFFF)
     static let navigation = color(0x111113, 0xF5F5F6)
     static let composer = color(0x19191B, 0xF6F6F7)
+    static let commandPreview = color(0x111113, 0xEDEDF0)
     static let bubble = color(0x232326, 0xEDEDF0)
     static let selection = color(0x26262A, 0xE4E4E8)
     static let accent = color(0xD18568, 0xA3482F)
@@ -59,7 +60,9 @@ enum WorkspaceStyle {
 
     static func elapsed(since date: Date) -> String {
         let seconds = max(0, Int(-date.timeIntervalSinceNow))
-        return "\(seconds / 60):\(String(format: "%02d", seconds % 60))"
+        let clock = String(format: "%02d:%02d", (seconds / 60) % 60, seconds % 60)
+        let hours = seconds / 3_600
+        return hours > 0 ? "\(hours):\(clock)" : clock
     }
 
     private static func color(_ dark: UInt32, _ light: UInt32) -> NSColor {

@@ -304,7 +304,7 @@ final class PullRequestDetailController: NSViewController, NSTableViewDataSource
     @objc private func mathRenderingChanged(_ notification: Notification) { renderBody() }
 
     private func setDocument(_ content: NSAttributedString) {
-        document.textStorage?.setAttributedString(content)
+        document.setTranscript(content)
         for request in TranscriptRenderingRequest.missing(in: content) where renderingDocument.insert(request).inserted {
             request.load { [weak self] ready in
                 guard let self else { return }

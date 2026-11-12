@@ -15,7 +15,26 @@ integrity() {
   openssl dgst -sha512 -binary "$1" | openssl base64 -A
 }
 
-install_asset() {
+package_archive() (
+  name=$1
+  version=$2
+  checksum=$3
+  basename=${name##*/}
+  archive="$cache/$basename-$version.tgz"
+  if [ ! -s "$archive" ] || [ "$(integrity "$archive")" != "$checksum" ]; then
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --connect-timeout 10 --max-time 90 --retry 2 --output "$staging/$basename.tgz" \
+      "https://registry.npmjs.org/$name/-/$basename-$version.tgz"
+    if [ "$(integrity "$staging/$basename.tgz")" != "$checksum" ]; then
+      printf 'Archive integrity did not match for %s %s.\n' "$name" "$version" >&2
+      exit 1
+    fi
+    mv "$staging/$basename.tgz" "$archive"
+  fi
+  printf '%s\n' "$archive"
+)
+
+install_asset() (
   name=$1
   version=$2
   checksum=$3
@@ -28,20 +47,10 @@ install_asset() {
     return
   fi
 
-  archive="$cache/$name-$version.tgz"
-  if [ ! -s "$archive" ] || [ "$(integrity "$archive")" != "$checksum" ]; then
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-      --connect-timeout 10 --max-time 90 --retry 2 --output "$staging/$name.tgz" \
-      "https://registry.npmjs.org/$name/-/$name-$version.tgz"
-    if [ "$(integrity "$staging/$name.tgz")" != "$checksum" ]; then
-      printf 'Archive integrity did not match for %s %s.\n' "$name" "$version" >&2
-      exit 1
-    fi
-    mv "$staging/$name.tgz" "$archive"
-  fi
+  archive=$(package_archive "$name" "$version" "$checksum")
   tar -xOzf "$archive" "package/dist/$resource" > "$destination/$resource"
   tar -xOzf "$archive" package/LICENSE > "$destination/$name-LICENSE.txt"
-}
+)
 
 install_asset katex 0.18.10 '/B6p9eY9DX7aHBfpkHdpirDTZ5QH9xTwL9y837PWuzuv41O5jFdqNQwVQEQsimY0/iVNkwBY4+4hMfhQ7d4Dbw==' katex.min.js
 install_asset pele 1.8.0 'AYmHttE70cwNJVXdfPMCANGivFlmc3bGGpMG0GqH5S5vE3RgtEuLlkqbhRfe94Csv/ZEd1TUbv2dMUHpw4p1Bg==' pele.global.js
@@ -70,3 +79,27 @@ if [ -n "$parser_node" ] && [ -f "$1/packages/client-runtime/src/mcpApps/host.ts
 fi
 install -m 644 "$app_source" "$destination/mcp-app-host.js"
 install -m 644 "$app_host/McpAppHost-LICENSES.md" "$directory/Assets/TranscriptRenderer/mcp-app-bridge.js" "$destination/"
+
+highlights_version=0.5.0
+highlights_package="$dependencies/@pierre/highlights"
+if [ ! -d "$highlights_package" ] && [ -d "$dependencies/@pierre/diffs" ]; then
+  diffs_package=$(CDPATH= cd -- "$dependencies/@pierre/diffs" && pwd -P)
+  highlights_package="${diffs_package%/*}/highlights"
+fi
+installed_version=$(plutil -extract version raw -o - "$highlights_package/package.json" 2>/dev/null || true)
+if [ "$installed_version" != "$highlights_version" ]; then
+  archive=$(package_archive @pierre/highlights "$highlights_version" 'G8gscrHrik3YjKd+tPTcmivJ/W0zRrtg4adVxnfX7+415+0Qplo6qUWuEX5R0UkA1fMhmE2sOSuLBMNGDtLhIw==')
+  mkdir -p "$staging/highlights"
+  tar -xzf "$archive" -C "$staging/highlights"
+  highlights_package="$staging/highlights/package"
+fi
+syntax="$destination/Syntax"
+mkdir -p "$syntax/highlights/themes"
+install -m 644 "$directory/Assets/TranscriptRenderer/Syntax/index.html" "$directory/Assets/TranscriptRenderer/Syntax/highlight.js" "$syntax/"
+for module in highlighter.js theme.js tokens.js token-types.js ansi.js languages.js highlights.wasm.mjs; do
+  install -m 644 "$highlights_package/dist/$module" "$syntax/highlights/"
+done
+for theme in github-dark-high-contrast github-light-high-contrast; do
+  install -m 644 "$highlights_package/dist/themes/$theme.js" "$syntax/highlights/themes/"
+done
+install -m 644 "$highlights_package/LICENSE.md" "$highlights_package/NOTICE.md" "$syntax/highlights/"

@@ -126,6 +126,9 @@ final class Workspace {
     private var cloneTask: Task<Void, Never>?
     private var api: EnvironmentAPI?
     private var socket: RPCSocket?
+    private var providerUsageActive = false
+    private var providerUsageActivityTask: Task<Void, Never>?
+    private let providerUsageClientID = UUID().uuidString
     private var socketID = UUID()
     private var auth: Wire = .null
     private var generation = UUID()
@@ -147,8 +150,10 @@ final class Workspace {
     private(set) var sideChatDetail = ThreadDetail()
     private(set) var sideChatError: String?
     private(set) var providers: [Provider] = []
+    private var providerUpdateRevision = 0
     private(set) var providerConfigurations: Payload?
     private var usageLimitSnapshots: [UsageLimitSource] = []
+    private(set) lazy var usageLimitRefresh = UsageLimitRefresh(workspace: self)
     private(set) var usageHubSettings = UsageHubSettings()
     var settingsSecretProviders: [SettingsSecretProvider] { usageHubSettings.secretProviders }
     private(set) var usageModelFilter: Wire = .null
@@ -579,6 +584,9 @@ final class Workspace {
                 guard !Task.isCancelled, generation == self.generation else { return }
                 if let socket = self.socket { await socket.close() }
                 guard !Task.isCancelled, generation == self.generation else { return }
+                providerUsageActivityTask?.cancel()
+                providerUsageActivityTask = nil
+                usageLimitRefresh.reset()
                 socket = nil
                 self.api = nil
                 voiceInput.cancel()
@@ -633,7 +641,7 @@ final class Workspace {
                             applyServerSettings(payload["settings"])
                         default:
                             if payload["providers"] != .null {
-                                providers = payload["providers"].array.compactMap(Provider.init)
+                                updateProviders(payload["providers"].array.compactMap(Provider.init))
                             }
                         }
                     }
@@ -666,7 +674,7 @@ final class Workspace {
         }
         scratchWorkspaceRoot = config["scratchWorkspaceRoot"].string
         newProjectsRoot = config["newProjectsRoot"].string
-        providers = config["providers"].array.compactMap(Provider.init)
+        updateProviders(config["providers"].array.compactMap(Provider.init))
         usageLimitSnapshots = config["usageLimitSources"].array.compactMap(UsageLimitSource.init)
         usageHubSettings.supportsReferences = config["secretReferences"].bool == true
         applyServerSettings(config["settings"])
@@ -784,6 +792,8 @@ final class Workspace {
             connection = .ready
             connectionError = nil
             change.insert(.connection)
+            syncProviderUsageActivity()
+            usageLimitRefresh.startPeriodic()
             reportBrowserProfiles()
             if let selection { subscribeToThread(selection) }
             if sideChat != nil { subscribeToSideChat() }
@@ -847,6 +857,9 @@ final class Workspace {
         relatedLanding = nil
         currentServerID = nil
         connectionTask?.cancel()
+        providerUsageActivityTask?.cancel()
+        providerUsageActivityTask = nil
+        usageLimitRefresh.reset()
         threadTask?.cancel()
         sideChatTask?.cancel()
         finishSideChatWaits()
@@ -1284,6 +1297,56 @@ final class Workspace {
         return try await socket.request(method, payload, timeout: timeout)
     }
 
+    func updateProviderUsageActivity(active: Bool) {
+        guard providerUsageActive != active else { return }
+        providerUsageActive = active
+        syncProviderUsageActivity()
+    }
+
+    private func syncProviderUsageActivity() {
+        providerUsageActivityTask?.cancel()
+        providerUsageActivityTask = nil
+        guard let socket, can("orchestration:read") else { return }
+        let active = providerUsageActive
+        let clientID = providerUsageClientID
+        let formatter = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        let scopes: [Wire] = active ? [.object(["type": .string("provider-status")])] : []
+        providerUsageActivityTask = Task { [socket] in
+            while !Task.isCancelled {
+                _ = try? await socket.request("server.reportClientActivity", [
+                    "clientId": .string(clientID), "clientKind": .string("desktop-renderer"),
+                    "visible": .bool(active), "focused": .bool(active), "recentlyInteracted": .bool(false),
+                    "appState": .string(active ? "active" : "background"),
+                    "scopes": .array(scopes),
+                    "ttlMs": .int(45_000), "observedAt": .string(formatter.format(.now)),
+                ], timeout: .seconds(12))
+                guard active, !Task.isCancelled else { return }
+                do { try await Task.sleep(for: .seconds(25)) }
+                catch { return }
+            }
+        }
+    }
+
+    private func updateProviders(_ next: [Provider]) {
+        providerUpdateRevision += 1
+        providers = next
+    }
+
+    func readFreshUsageLimits(connection: UUID) async throws {
+        guard connectionID == connection, can("orchestration:read") else { throw ClientError.disconnected }
+        let revision = providerUpdateRevision
+        let response = try await request("server.refreshProviders", ["workspaceSnapshotsOnDemand": .bool(true)])
+        try Task.checkCancellation()
+        guard connectionID == connection else { throw ClientError.disconnected }
+        // A config event received during the refresh may already carry newer provider data.
+        guard providerUpdateRevision == revision, case .array(let snapshots) = response["providers"] else { return }
+        let next = snapshots.compactMap(Provider.init)
+        guard providers != next else { return }
+        updateProviders(next)
+        syncDraftFileCheckout()
+        onChange?(.providers)
+    }
+
     func readWorkspaceFile(_ target: WorkspaceFileTarget, connection: UUID) async throws -> WorkspaceFileContents {
         guard environment?.id == target.environmentID, connectionID == connection, can("filesystem:read") else {
             throw ClientError.disconnected
@@ -1667,9 +1730,12 @@ final class Workspace {
 
     func editQueuedMessage(_ attempt: QueueEditAttempt, threadID: String, runID: String, connection: UUID) async throws {
         guard canEditQueue(threadID: threadID, connection: connection), let socket, let api else { throw ClientError.disconnected }
+        guard let message = presentedDetail(for: threadID)?.queue.state.messages.first(where: { $0.id == runID && $0.editable }) else {
+            throw ClientError.message("This message is no longer queued.")
+        }
         let content = attempt.content
         let generation = self.generation
-        let context = presentedDetail(for: threadID)?.queue.state.messages.first { $0.id == runID }?.context ?? .null
+        let context = message.context
         var records = context["records"].array
         var fields: Payload = ["commandId": .string(attempt.commandID), "runId": .string(runID)]
         if let retained = content.retained {

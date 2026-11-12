@@ -67,6 +67,11 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         let height: CGFloat?
     }
 
+    private enum ScrollPosition {
+        case bottom
+        case row(id: String, offset: CGFloat)
+    }
+
     private final class CachedPage {
         let reference: ConversationPage
         let scope: AttachmentScope?
@@ -80,7 +85,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
     }
 
     private let table = NSTableView()
-    private lazy var scroll = scroller(for: table)
+    private let scroll = TimelineScrollView()
     private var rows: [EntryRow] = []
     private var expanded = Set<String>()
     private var rendered: [String: NSAttributedString] = [:]
@@ -92,6 +97,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
     private var fileLoads: [String: Task<Void, Never>] = [:]
     private var fileErrors: [String: String] = [:]
     private var columnWidth: CGFloat = 0
+    private var resizePosition: ScrollPosition?
     private var findQuery = ""
     private var findMatch: ThreadFindMatch?
     private var forkEnabled = false
@@ -112,6 +118,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
     private(set) var fileContext: WorkspaceFileContext?
     var attachmentStore: AttachmentStore?
     private var attachmentScope: AttachmentScope?
+    weak var readingColumn: NSView?
     var canSavePlanToWorkspace = false
     var loadFileDetail: (@MainActor (TimelineEntry) async throws -> Wire)?
     var loadWebPage: (@MainActor (ConversationPage, AttachmentScope) async throws -> AttachmentFile)?
@@ -133,7 +140,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         table.dataSource = self
         table.setAccessibilityLabel("Conversation")
         pageCards.countLimit = 6
-        fill(scroll, in: self)
+        fill(scroller(for: table, using: scroll), in: self)
         NotificationCenter.default.addObserver(self, selector: #selector(mathRenderingChanged(_:)),
                                                name: TranscriptMathRendering.didChange, object: nil)
     }
@@ -170,6 +177,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         fileDetails.removeAll()
         rendered.removeAll()
         renderingRows.removeAll()
+        resizePosition = nil
         pageLayouts.removeAll()
         pageCards.removeAllObjects()
         rows.removeAll()
@@ -299,12 +307,12 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         return .shown
     }
 
-    func render(_ entries: [TimelineEntry], runModels: [String: Wire], providers: [Provider], workspacePath: String?,
+    func render(_ entries: [TimelineEntry], runModels: [String: Wire], activeRunIDs: Set<String>, providers: [Provider], workspacePath: String?,
                 fileContext: WorkspaceFileContext? = nil, guestShare: GuestShare? = nil,
                 canResolveGuestMessages: Bool = false, busyGuestMessages: Set<String> = []) {
         let contextChanged = self.fileContext != fileContext
         self.fileContext = fileContext
-        var next = makeRows(entries, runModels: runModels, providers: providers, workspacePath: workspacePath)
+        var next = makeRows(entries, runModels: runModels, activeRunIDs: activeRunIDs, providers: providers, workspacePath: workspacePath)
         if let guestShare {
             for message in guestShare.pending {
                 let row = GuestRow(shareID: guestShare.id, name: guestShare.guestName ?? "Guest", message: message,
@@ -313,11 +321,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
             }
         }
         guard contextChanged || rows != next else { return }
-        let visible = scroll.contentView.bounds
-        let pinned = table.bounds.maxY - visible.maxY < 48 || rows.isEmpty
-        let top = table.row(at: NSPoint(x: 1, y: visible.minY + 1))
-        let topID = rows.indices.contains(top) ? rows[top].id : nil
-        let offset = top >= 0 ? visible.minY - table.rect(ofRow: top).minY : 0
+        let position = scrollPosition
         let previous = rows
         rows = next
         let oldPageIDs = previous.compactMap { row in
@@ -351,15 +355,34 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
             rendered = rendered.filter { stable.contains($0.key) }
             table.reloadData()
         }
-        if pinned && !next.isEmpty {
-            table.scrollRowToVisible(next.count - 1)
-        } else if let topID, let newTop = next.firstIndex(where: { $0.id == topID }) {
-            scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: newTop).minY + offset)))
-            scroll.reflectScrolledClipView(scroll.contentView)
-        }
+        restoreScrollPosition(position)
     }
 
-    private func makeRows(_ entries: [TimelineEntry], runModels: [String: Wire], providers: [Provider],
+    private var scrollPosition: ScrollPosition? {
+        let visible = scroll.contentView.bounds
+        if rows.isEmpty || table.bounds.maxY - visible.maxY < 48 { return .bottom }
+        let top = table.row(at: NSPoint(x: 1, y: visible.minY + 1))
+        guard rows.indices.contains(top) else { return nil }
+        return .row(id: rows[top].id, offset: visible.minY - table.rect(ofRow: top).minY)
+    }
+
+    private func restoreScrollPosition(_ position: ScrollPosition?) {
+        guard let position, !rows.isEmpty else { return }
+        let clip = scroll.contentView
+        let y: CGFloat
+        switch position {
+        case .bottom:
+            y = table.rect(ofRow: rows.count - 1).maxY - clip.bounds.height
+        case .row(let id, let offset):
+            guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+            let row = table.rect(ofRow: index)
+            y = row.minY + min(offset, max(0, row.height - 1))
+        }
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: max(0, y)))
+        scroll.reflectScrolledClipView(clip)
+    }
+
+    private func makeRows(_ entries: [TimelineEntry], runModels: [String: Wire], activeRunIDs: Set<String>, providers: [Provider],
                           workspacePath: String?) -> [EntryRow] {
         var result: [EntryRow] = []
         var work: [TimelineEntry] = []
@@ -388,7 +411,8 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
                 result.append(EntryRow(id: first.entry.id + "/files", content: .files(files)))
                 files.removeAll()
             }
-            if let reply = lastReply {
+            if let reply = lastReply, reply.value["streaming"].bool != true,
+               reply.value["runId"].string.map(activeRunIDs.contains) != true {
                 let selection = reply.value["runId"].string.flatMap { runModels[$0] } ?? .null
                 let instance = selection["instanceId"].string ?? selection["provider"].string
                 let provider = providers.first { $0.id == instance }
@@ -472,13 +496,25 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         return .init(title: title, reference: reference)
     }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        if frame.size != newSize, !rows.isEmpty, resizePosition == nil { resizePosition = scrollPosition }
+        super.setFrameSize(newSize)
+        if resizePosition != nil { needsLayout = true }
+    }
+
     override func layout() {
+        let position = resizePosition ?? scrollPosition
+        let resized = resizePosition != nil
+        resizePosition = nil
         super.layout()
+        if let width = readingColumn?.bounds.width, width > 38 { scroll.readingWidth = width - 38 }
         let width = table.tableColumns[0].width
-        if abs(columnWidth - width) > 1 {
+        let reflow = abs(columnWidth - width) > 1
+        if reflow {
             columnWidth = width
             table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: rows.indices))
         }
+        if resized || reflow { restoreScrollPosition(position) }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -662,10 +698,10 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
                   case .webPage(let current) = rows[index].content, current == reference else { return }
             let next = PageLayout(reference: reference, width: width, zoom: zoom, height: height)
             guard pageLayouts[id] != next else { return }
-            let pinned = table.bounds.maxY - scroll.contentView.bounds.maxY < 48
+            let position = scrollPosition
             pageLayouts[id] = next
             table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: index))
-            if pinned { table.scrollRowToVisible(rows.count - 1) }
+            restoreScrollPosition(position)
         }
         return card
     }
@@ -1041,7 +1077,7 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         text.textContainerInset = .zero
         text.textContainer?.lineFragmentPadding = 0
         text.textContainer?.widthTracksTextView = true
-        text.textStorage?.setAttributedString(content)
+        text.setTranscript(content)
         text.onCitation = { [weak self, weak text] citation, frame in
             guard let self, let text, text.window != nil else { return }
             citationPopup?.close()
@@ -1177,8 +1213,11 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
             let id = rows[index].id
             return waiting.contains(id) && rendered[id].map { TranscriptRenderingRequest.missing(in: $0).contains(request) } == true
         })
+        guard !indexes.isEmpty else { return }
+        let position = scrollPosition
         for index in indexes { rendered.removeValue(forKey: rows[index].id) }
         reload(indexes)
+        restoreScrollPosition(position)
     }
 
     private func planTitleMatches(_ item: EntryRow, query: String) -> Int {
@@ -1275,5 +1314,21 @@ final class TimelineView: NSView, NSTableViewDelegate, NSTableViewDataSource {
         guard !indexes.isEmpty else { return }
         table.noteHeightOfRows(withIndexesChanged: indexes)
         table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+    }
+}
+
+@MainActor
+private final class TimelineScrollView: NSScrollView {
+    var readingWidth: CGFloat? {
+        didSet { if oldValue != readingWidth { tile() } }
+    }
+
+    override func tile() {
+        super.tile()
+        guard let readingWidth else { return }
+        let area = contentView.frame
+        let width = min(readingWidth, area.width)
+        let leading = min(area.maxX - width, max(area.minX, bounds.midX - width / 2))
+        contentView.frame = NSRect(x: leading, y: area.minY, width: width, height: area.height)
     }
 }

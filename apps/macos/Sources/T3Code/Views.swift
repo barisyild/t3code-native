@@ -2,7 +2,7 @@ import AppKit
 
 @MainActor
 final class ActionButton: NSButton {
-    enum Style { case system, subtle, send }
+    enum Style { case system, subtle, send, capsule, filled }
 
     var actionBlock: () -> Void
     var isMarked = false { didSet { if oldValue != isMarked { needsDisplay = true } } }
@@ -24,7 +24,12 @@ final class ActionButton: NSButton {
         if style != .system {
             isBordered = false
             font = .systemFont(ofSize: 13)
-            contentTintColor = style == .send ? WorkspaceStyle.canvas : WorkspaceStyle.secondary
+            contentTintColor = usesInvertedTint ? WorkspaceStyle.canvas : WorkspaceStyle.secondary
+        }
+        if hasCapsuleShape {
+            font = .systemFont(ofSize: 12, weight: style == .filled ? .semibold : .medium)
+            imageHugsTitle = true
+            focusRingType = .exterior
         }
         if iconOnly { toolTip = title }
         setAccessibilityLabel(title)
@@ -37,14 +42,14 @@ final class ActionButton: NSButton {
 
     override var isEnabled: Bool {
         didSet {
-            if style == .send { contentTintColor = isEnabled ? WorkspaceStyle.canvas : WorkspaceStyle.muted }
+            if usesInvertedTint { contentTintColor = isEnabled ? WorkspaceStyle.canvas : WorkspaceStyle.muted }
         }
     }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverArea { removeTrackingArea(hoverArea) }
-        guard style == .subtle else { return }
+        guard style == .subtle || hasCapsuleShape else { return }
         let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                   owner: self, userInfo: nil)
         hoverArea = area
@@ -64,9 +69,39 @@ final class ActionButton: NSButton {
         case .subtle where isEnabled && (isMarked || hovered || isHighlighted):
             WorkspaceStyle.selection.setFill()
             NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
+        case .capsule:
+            let path = capsulePath
+            let fill = isEnabled && (hovered || isHighlighted) ? WorkspaceStyle.bubble : WorkspaceStyle.navigation
+            fill.setFill()
+            path.fill()
+            WorkspaceStyle.outline.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        case .filled:
+            let fill = isEnabled ? (hovered || isHighlighted ? WorkspaceStyle.secondary : WorkspaceStyle.ink) : WorkspaceStyle.selection
+            fill.setFill()
+            capsulePath.fill()
         default: break
         }
         super.draw(dirtyRect)
+    }
+
+    private var hasCapsuleShape: Bool { style == .capsule || style == .filled }
+    private var usesInvertedTint: Bool { style == .send || style == .filled }
+
+    private var capsulePath: NSBezierPath {
+        let frame = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let radius = max(0, frame.height / 2)
+        return NSBezierPath(roundedRect: frame, xRadius: radius, yRadius: radius)
+    }
+
+    override var focusRingMaskBounds: NSRect {
+        hasCapsuleShape ? bounds : super.focusRingMaskBounds
+    }
+
+    override func drawFocusRingMask() {
+        if hasCapsuleShape { capsulePath.fill() }
+        else { super.drawFocusRingMask() }
     }
 
     @objc private func performAction() { actionBlock() }
@@ -151,8 +186,7 @@ final class Surface: NSView {
 }
 
 @MainActor
-func scroller(for document: NSView, horizontal: Bool = false) -> NSScrollView {
-    let scroll = NSScrollView()
+func scroller(for document: NSView, horizontal: Bool = false, using scroll: NSScrollView = NSScrollView()) -> NSScrollView {
     scroll.drawsBackground = false
     scroll.hasVerticalScroller = true
     scroll.hasHorizontalScroller = horizontal

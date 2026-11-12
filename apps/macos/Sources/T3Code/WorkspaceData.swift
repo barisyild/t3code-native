@@ -349,7 +349,7 @@ struct ThreadDetail {
     private(set) var loaded = false
     private(set) var sequence = -1
     private var latestOrdinal = -1
-    private var activeRuns: Set<String> = []
+    private(set) var activeRunIDs: Set<String> = []
     private var recentMessages: [String: Wire] = [:]
     private var messageOrder: [String] = []
 
@@ -358,6 +358,14 @@ struct ThreadDetail {
         return entries.filter { entry in
             !queue.hides(entry) && !(entry.isLocal && entry.value["runId"].string.map(rewind.rolledBack) == true)
         }
+    }
+
+    func liveActivity(for runID: String?) -> ThreadLiveActivity? {
+        guard let runID, activeRunIDs.contains(runID) else { return nil }
+        for entry in entries.reversed() where entry.isLocal && entry.value["runId"].string == runID {
+            if let activity = ThreadLiveActivity(entry: entry) { return activity }
+        }
+        return nil
     }
 
     mutating func apply(_ frame: Wire) {
@@ -422,7 +430,7 @@ struct ThreadDetail {
         relationships.load(projection)
         mergeRuns = ThreadMergeRuns()
         self.latestOrdinal = latestOrdinal ?? entries.lazy.filter(\.isLocal).map(\.ordinal).max() ?? -1
-        activeRuns.removeAll()
+        activeRunIDs.removeAll()
         runModels.removeAll()
         for run in projection["runs"].array { applyRun(run) }
         requests.removeAll()
@@ -437,8 +445,8 @@ struct ThreadDetail {
         guard let id = value["id"].string, let status = value["status"].string else { return }
         mergeRuns.apply(value)
         if value["modelSelection"] != .null { runModels[id] = value["modelSelection"] }
-        if ThreadSummary.working.contains(status) { activeRuns.insert(id) }
-        else { activeRuns.remove(id) }
+        if ThreadSummary.working.contains(status) { activeRunIDs.insert(id) }
+        else { activeRunIDs.remove(id) }
     }
 
     private mutating func applyRequest(_ value: Wire) {
@@ -478,7 +486,7 @@ struct ThreadDetail {
         } else if historyCursor != nil && entry.ordinal <= latestOrdinal {
             let run = entry.value["runId"].string
             let isVisibleRun = run.map { id in
-                activeRuns.contains(id) || entries.contains {
+                activeRunIDs.contains(id) || entries.contains {
                     $0.isLocal && $0.value["runId"].string == id && $0.ordinal <= entry.ordinal
                 }
             } ?? false

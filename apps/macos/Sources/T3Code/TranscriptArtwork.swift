@@ -43,13 +43,18 @@ struct TranscriptArtworkImage {
 enum TranscriptRenderingRequest: Hashable {
     case math(String)
     case artwork(TranscriptArtwork)
+    case syntax(TranscriptSyntax)
 
     static let mathSource = NSAttributedString.Key("T3TranscriptMathSource")
 
     static func missing(in content: NSAttributedString) -> Set<Self> {
         var requests = Set(TranscriptArtwork.missing(in: content).map(Self.artwork))
-        content.enumerateAttribute(mathSource, in: NSRange(location: 0, length: content.length)) { value, _, _ in
+        let range = NSRange(location: 0, length: content.length)
+        content.enumerateAttribute(mathSource, in: range) { value, _, _ in
             if let source = value as? String { requests.insert(.math(source)) }
+        }
+        content.enumerateAttribute(TranscriptSyntax.attribute, in: range) { value, _, _ in
+            if let syntax = value as? TranscriptSyntax { requests.insert(.syntax(syntax)) }
         }
         return requests
     }
@@ -61,6 +66,8 @@ enum TranscriptRenderingRequest: Hashable {
             Task { finished(!(await TranscriptMathParser.shared.prepare(source)).isEmpty) }
         case .artwork(let artwork):
             TranscriptArtworkRenderer.shared.load(artwork, finished: finished)
+        case .syntax(let syntax):
+            TranscriptSyntaxRenderer.shared.load(syntax, finished: finished)
         }
     }
 }

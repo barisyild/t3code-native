@@ -2,7 +2,7 @@ import AppKit
 
 @MainActor
 final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelegate {
-    enum Action { case resume, send(String), edit(String), remove(String) }
+    enum Action { case resume, send(String), edit(String), remove(String), reorder(ThreadQueue.Reorder) }
 
     private let caption = label(size: 11.5, weight: .medium, color: WorkspaceStyle.muted)
     private let table = NSTableView()
@@ -13,6 +13,8 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
     private var canOperate = false
     private var canEdit = false
     private var busy = false
+    private weak var dragSource: QueueDragHandle?
+    private var canReorder: Bool { canOperate && !busy && state.messages.count > 1 }
     var onAction: ((Action) -> Void)?
 
     override init(frame: NSRect) {
@@ -29,6 +31,7 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
         table.rowHeight = 31
         table.dataSource = self
         table.delegate = self
+        table.registerForDraggedTypes([QueueDragHandle.pasteboardType])
         table.setAccessibilityLabel("Queued Messages")
         listHeight = scroll.heightAnchor.constraint(equalToConstant: 0)
         listHeight.priority = .defaultHigh
@@ -51,6 +54,7 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
         self.canOperate = canOperate
         self.canEdit = canEdit
         self.busy = busy
+        if !canReorder || previous != state.messages { invalidateDrag() }
         isHidden = hidden
         let count = state.messages.count
         caption.stringValue = state.held ? (count == 0 ? "Queue paused" : "\(count) queued · Paused") : "\(count) queued"
@@ -74,6 +78,31 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
     func numberOfRows(in tableView: NSTableView) -> Int { state.messages.count }
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
 
+    func invalidateDrag() { dragSource = nil }
+
+    func tableView(_ tableView: NSTableView, validateDrop info: any NSDraggingInfo, proposedRow row: Int,
+                   proposedDropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        let belowMiddle = proposedDropOperation == .on && state.messages.indices.contains(row) &&
+            tableView.convert(info.draggingLocation, from: nil).y > tableView.rect(ofRow: row).midY
+        let insertion = belowMiddle ? row + 1 : row
+        guard drop(info, at: insertion) != nil else { return [] }
+        tableView.setDropRow(insertion, dropOperation: .above)
+        return .move
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: any NSDraggingInfo, row: Int,
+                   dropOperation: NSTableView.DropOperation) -> Bool {
+        guard let move = drop(info, at: row) else { return false }
+        invalidateDrag()
+        onAction?(.reorder(move))
+        return true
+    }
+
+    private func drop(_ info: any NSDraggingInfo, at row: Int) -> ThreadQueue.Reorder? {
+        guard canReorder, let source = info.draggingSource as? QueueDragHandle, source === dragSource else { return nil }
+        return state.reorder(moving: source.runID, to: row)
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row index: Int) -> NSView? {
         let message = state.messages[index]
         let names = message.attachments.compactMap { $0["name"].string }.map(BrowserAnnotationContext.attachmentLabel)
@@ -88,19 +117,45 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
         let send = control("Send Queued Message Now", symbol: "arrow.up", action: .send(message.id))
         let edit = control("Edit Queued Message…", symbol: "pencil", action: .edit(message.id))
         let remove = control("Remove Queued Message", symbol: "xmark", action: .remove(message.id))
-        let cell = QueuedMessageRow(send: send, edit: edit, remove: remove)
-        fill(row([preview, detail, NSView(), send, edit, remove], spacing: 5), in: cell, inset: 2)
+        let grip = QueueDragHandle(runID: message.id)
+        let cell = QueuedMessageRow(grip: grip, send: send, edit: edit, remove: remove)
+        grip.dragPreview = cell
+        grip.onBegin = { [weak self] source in
+            guard let self, canReorder, state.messages.contains(where: { $0.id == source.runID }) else { return false }
+            dragSource = source
+            return true
+        }
+        grip.onEnd = { [weak self] source in
+            if self?.dragSource === source { self?.invalidateDrag() }
+        }
+        fill(row([grip, preview, detail, NSView(), send, edit, remove], spacing: 6), in: cell, inset: 2)
         updateControls(cell, for: message)
         return cell
     }
 
     private func updateControls(_ cell: QueuedMessageRow, for message: QueuedMessage) {
+        cell.grip.isEnabled = canReorder
+        cell.grip.setAccessibilityCustomActions(canReorder ? [
+            moveAction("Move Up", runID: message.id, direction: -1),
+            moveAction("Move Down", runID: message.id, direction: 1),
+        ].compactMap { $0 } : [])
         cell.send.isHidden = !canOperate || state.delivery(for: message) == nil
         cell.send.isEnabled = !busy
         cell.edit.isHidden = !canOperate || !message.editable
         cell.edit.isEnabled = canEdit && !busy
         cell.remove.isHidden = !canOperate
         cell.remove.isEnabled = !busy
+    }
+
+    private func moveAction(_ name: String, runID: String, direction: Int) -> NSAccessibilityCustomAction? {
+        guard let index = state.messages.firstIndex(where: { $0.id == runID }),
+              state.reorder(moving: runID, to: index + direction + (direction > 0 ? 1 : 0)) != nil else { return nil }
+        return NSAccessibilityCustomAction(name: name) { [weak self] in
+            guard let self, canReorder, let index = state.messages.firstIndex(where: { $0.id == runID }),
+                  let move = state.reorder(moving: runID, to: index + direction + (direction > 0 ? 1 : 0)) else { return false }
+            onAction?(.reorder(move))
+            return true
+        }
     }
 
     private func control(_ title: String, symbol: String, action: Action) -> ActionButton {
@@ -113,11 +168,13 @@ final class QueuedMessagesView: NSView, NSTableViewDataSource, NSTableViewDelega
 
 @MainActor
 private final class QueuedMessageRow: NSTableCellView {
+    let grip: QueueDragHandle
     let send: ActionButton
     let edit: ActionButton
     let remove: ActionButton
 
-    init(send: ActionButton, edit: ActionButton, remove: ActionButton) {
+    init(grip: QueueDragHandle, send: ActionButton, edit: ActionButton, remove: ActionButton) {
+        self.grip = grip
         self.send = send
         self.edit = edit
         self.remove = remove
@@ -126,4 +183,80 @@ private final class QueuedMessageRow: NSTableCellView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+}
+
+@MainActor
+private final class QueueDragHandle: NSView, NSDraggingSource {
+    static let pasteboardType = NSPasteboard.PasteboardType("dev.t3code.appkit.queued-message")
+    let runID: String
+    weak var dragPreview: NSView?
+    var onBegin: ((QueueDragHandle) -> Bool)?
+    var onEnd: ((QueueDragHandle) -> Void)?
+    private var dragging = false
+    var isEnabled = false {
+        didSet {
+            guard oldValue != isEnabled else { return }
+            setAccessibilityEnabled(isEnabled)
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
+    }
+
+    init(runID: String) {
+        self.runID = runID
+        super.init(frame: .zero)
+        toolTip = "Drag to reorder"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Reorder queued message")
+        setAccessibilityEnabled(false)
+        widthAnchor.constraint(equalToConstant: 22).isActive = true
+        heightAnchor.constraint(equalToConstant: 22).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func resetCursorRects() {
+        if isEnabled { addCursorRect(bounds, cursor: .openHand) }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        WorkspaceStyle.bubble.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5).fill()
+        (isEnabled ? WorkspaceStyle.secondary : WorkspaceStyle.muted).setFill()
+        let dots = NSBezierPath()
+        for x: CGFloat in [-2.25, 2.25] {
+            for y: CGFloat in [-4.25, 0, 4.25] {
+                dots.appendOval(in: NSRect(x: bounds.midX + x - 1, y: bounds.midY + y - 1, width: 2, height: 2))
+            }
+        }
+        dots.fill()
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isEnabled, !dragging, window != nil else { return }
+        let preview = dragPreview ?? self
+        guard let representation = preview.bitmapImageRepForCachingDisplay(in: preview.bounds), onBegin?(self) == true else { return }
+        preview.cacheDisplay(in: preview.bounds, to: representation)
+        let image = NSImage(size: preview.bounds.size)
+        image.addRepresentation(representation)
+        let item = NSPasteboardItem()
+        item.setString(runID, forType: Self.pasteboardType)
+        let dragItem = NSDraggingItem(pasteboardWriter: item)
+        dragItem.setDraggingFrame(convert(preview.bounds, from: preview), contents: image)
+        dragging = true
+        beginDraggingSession(with: [dragItem], event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .withinApplication ? .move : []
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragging = false
+        onEnd?(self)
+    }
 }

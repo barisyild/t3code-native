@@ -426,20 +426,37 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
 
         let name = label(item.title, size: 13, color: WorkspaceStyle.ink)
         name.toolTip = item.detail ?? item.title
+        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let icon = WorkspaceStyle.icon(item.icon ?? "bubble.left", size: 12,
                                        tint: item.needsInput ? WorkspaceStyle.accent : WorkspaceStyle.secondary)
         icon.widthAnchor.constraint(equalToConstant: 15).isActive = true
-        let stack = row([icon, name, NSView()], spacing: 7)
+        let stack = row([icon, name], spacing: 7)
         if let date = WorkspaceStyle.date(item.timestamp) {
             let time = label(item.isWorking ? WorkspaceStyle.elapsed(since: date) : WorkspaceStyle.age(date),
-                             size: 11, color: item.isWorking ? WorkspaceStyle.accent : WorkspaceStyle.muted)
+                             size: 11, color: WorkspaceStyle.muted)
+            time.setContentHuggingPriority(.required, for: .horizontal)
             time.setContentCompressionResistancePriority(.required, for: .horizontal)
+            stack.edgeInsets.right = 5
             if item.isWorking {
-                time.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+                time.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+                time.textColor = WorkspaceStyle.secondary
+                time.alignment = .center
+                time.setAccessibilityLabel("Elapsed time")
+                let badge = Surface(WorkspaceStyle.composer, border: WorkspaceStyle.outline, radius: 5)
+                badge.addSubview(time)
+                time.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    badge.heightAnchor.constraint(equalToConstant: 17),
+                    time.leadingAnchor.constraint(equalTo: badge.leadingAnchor, constant: 5),
+                    time.trailingAnchor.constraint(equalTo: badge.trailingAnchor, constant: -5),
+                    time.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+                ])
                 cell.activityStart = date
                 cell.timeLabel = time
+                stack.addArrangedSubview(badge)
+            } else {
+                stack.addArrangedSubview(time)
             }
-            stack.addArrangedSubview(time)
         }
         fill(stack, in: cell, inset: 3)
         cell.textField = name

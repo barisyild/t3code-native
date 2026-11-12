@@ -262,6 +262,45 @@ struct WorkspaceDataTests {
         #expect(detail.timeline.map(\.id) == ["queued", "active"])
     }
 
+    @Test func liveActivityFollowsOnlyRunningItemsFromTheCurrentTurn() {
+        func work(_ id: String, ordinal: Int, run: String, type: String, status: String,
+                  fields: Payload = [:]) -> Wire {
+            .object(fields.merging([
+                "id": .string(id), "ordinal": .int(ordinal), "runId": .string(run), "threadId": .string("thread"),
+                "type": .string(type), "status": .string(status),
+            ], uniquingKeysWith: { _, required in required }))
+        }
+        func projected(_ item: Wire, visibility: String = "local") -> Wire {
+            .object(["item": item, "visibility": .string(visibility)])
+        }
+        let search = work("search", ordinal: 2, run: "run", type: "file_search", status: "running",
+                          fields: ["pattern": .string("Sources/T3Code"), "title": .string("Searched Composer.swift in T3Code")])
+        let previous = work("previous", ordinal: 4, run: "old-run", type: "command_execution", status: "running",
+                            fields: ["input": .string("Old command")])
+        let inherited = work("inherited", ordinal: 5, run: "run", type: "command_execution", status: "running")
+        var detail = ThreadDetail()
+        detail.apply(.object([
+            "kind": .string("snapshot"), "snapshotSequence": .int(5),
+            "projection": .object([
+                "runs": .array([.object(["id": .string("run"), "status": .string("running")])]),
+                "visibleTurnItems": .array([projected(search), projected(previous), projected(inherited, visibility: "inherited")]),
+            ]),
+        ]))
+        #expect(detail.liveActivity(for: "run")?.detail == "Composer.swift in T3Code")
+
+        let command = work("command", ordinal: 6, run: "run", type: "command_execution", status: "running",
+                           fields: ["input": .string("swift test\nprint done")])
+        detail.apply(event("turn-item.updated", command, sequence: 6))
+        #expect(detail.liveActivity(for: "run")?.detail == "swift test")
+
+        detail.apply(event("turn-item.updated",
+                           work("command", ordinal: 6, run: "run", type: "command_execution", status: "completed"),
+                           sequence: 7))
+        #expect(detail.liveActivity(for: "run")?.detail == "Composer.swift in T3Code")
+        detail.apply(event("run.updated", .object(["id": .string("run"), "status": .string("completed")]), sequence: 8))
+        #expect(detail.liveActivity(for: "run") == nil)
+    }
+
     @Test func queuedMessagesStayInDeliveryOrderAndEnterTheTranscriptOnlyWhenSent() {
         var detail = ThreadDetail()
         let first = queueRun("first", ordinal: 1, position: 2, status: "queued")
@@ -290,6 +329,11 @@ struct WorkspaceDataTests {
         #expect(detail.queue.state.messages.first?.text == "Guest’s message")
         #expect(detail.queue.state.messages.first?.editable == false)
         #expect(detail.queue.state.held)
+        #expect(detail.queue.state.reorder(moving: "first", to: 0) == .init(runID: "first", beforeRunID: "second"))
+        #expect(detail.queue.state.reorder(moving: "second", to: 2) == .init(runID: "second", beforeRunID: nil))
+        #expect(detail.queue.state.reorder(moving: "second", to: 1) == nil)
+        #expect(detail.queue.state.reorder(moving: "auto", to: 0) == nil)
+        #expect(detail.queue.state.reorder(moving: "first", to: 3) == nil)
 
         detail.apply(event("run.updated", queueRun("first", ordinal: 1, position: 2, status: "cancelled"), sequence: 2))
         detail.apply(event("turn-item.updated", cancelledItem, sequence: 3))

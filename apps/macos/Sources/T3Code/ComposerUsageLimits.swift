@@ -19,6 +19,7 @@ final class ComposerUsageLimits: NSView {
     private var resizeObserver: NSObjectProtocol?
     private var deactivateObserver: NSObjectProtocol?
     weak var presentationView: NSView?
+    var onOpen: (() -> Void)?
     var onViewAll: (() -> Void)?
 
     init() {
@@ -117,6 +118,7 @@ final class ComposerUsageLimits: NSView {
         deactivateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) {
             [weak self] _ in MainActor.assumeIsolated { self?.close() }
         }
+        onOpen?()
     }
 
     private func updateCard() {

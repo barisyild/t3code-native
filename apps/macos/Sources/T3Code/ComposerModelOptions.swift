@@ -61,6 +61,21 @@ struct ComposerModelOption: Equatable, Sendable {
 }
 
 struct ComposerModelOptions: Equatable {
+    private struct Ultracode: Equatable {
+        let toggle: ComposerModelOption
+        let baseEffort: Wire
+
+        init?(_ descriptors: [ComposerModelOption]) {
+            guard let effort = descriptors.first(where: \.isReasoning), effort.id == "effort",
+                  let toggle = descriptors.first(where: { $0.id == "ultracode" && $0.kind == .boolean }) else { return nil }
+            let levels = effort.effortLevels
+            // Claude's legacy Ultracode level uses xhigh.
+            guard let base = levels.first(where: { $0.value == .string("xhigh") }) ?? levels.last else { return nil }
+            self.toggle = toggle
+            baseEffort = base.value
+        }
+    }
+
     struct EffortDots: Equatable {
         let count: Int
         let lit: Int
@@ -69,10 +84,16 @@ struct ComposerModelOptions: Equatable {
     let descriptors: [ComposerModelOption]
     private let selection: Wire
     private let overrides: Payload
+    private let family: ComposerProvider?
+    private let ultracode: Ultracode?
+    private static let ultracodeValue = Wire.string("ultracode")
 
-    init(selection: Wire = .null, descriptors: [ComposerModelOption] = []) {
+    init(selection: Wire = .null, descriptors: [ComposerModelOption] = [], family: ComposerProvider? = nil) {
         self.selection = selection
         self.descriptors = descriptors
+        self.family = family
+        let ultracode = family == .claude ? Ultracode(descriptors) : nil
+        self.ultracode = ultracode
         var values: Payload = [:]
         let options = selection["options"]
         if let legacy = options.object {
@@ -86,31 +107,57 @@ struct ComposerModelOptions: Equatable {
                 values[id] = value
             }
         }
-        if values["effort"] == .string("ultracode"),
-           descriptors.contains(where: { $0.id == "ultracode" && $0.kind == .boolean }),
-           descriptors.contains(where: { $0.id == "effort" && $0.accepts(.string("xhigh")) }) {
-            values["effort"] = .string("xhigh")
-            values["ultracode"] = values["ultracode"] ?? .bool(true)
+        if values["effort"] == Self.ultracodeValue, let ultracode {
+            values["effort"] = ultracode.baseEffort
+            values[ultracode.toggle.id] = values[ultracode.toggle.id] ?? .bool(true)
         }
         overrides = values
     }
 
     var reasoning: ComposerModelOption? { descriptors.first(where: \.isReasoning) }
     var speed: ComposerModelOption? { descriptors.first(where: \.isSpeed) }
+    var ultracodeToggle: ComposerModelOption? { ultracode?.toggle }
 
-    func override(for option: ComposerModelOption) -> Wire? { overrides[option.id] }
+    func override(for option: ComposerModelOption) -> Wire? {
+        guard option.id == "effort", let toggle = ultracodeToggle else { return overrides[option.id] }
+        guard overrides[option.id] != nil || overrides[toggle.id] != nil else { return nil }
+        return displayedValue(for: option) ?? overrides[option.id]
+    }
 
     func title(for option: ComposerModelOption) -> String {
-        let value = effectiveValue(for: option)
-        return option.choices.first { $0.value == value }?.title ?? option.title
+        let value = displayedValue(for: option)
+        return choices(for: option).first { $0.value == value }?.title ?? option.title
+    }
+
+    func choices(for option: ComposerModelOption) -> [ComposerModelOption.Choice] {
+        guard let choice = ultracodeChoice(for: option) else { return option.choices }
+        return option.choices.filter { $0.value != choice.value } + [choice]
+    }
+
+    func effortLevels(for option: ComposerModelOption) -> [ComposerModelOption.Choice] {
+        option.effortLevels + (ultracodeChoice(for: option).map { [$0] } ?? [])
     }
 
     func effortDots(for option: ComposerModelOption) -> EffortDots? {
-        let levels = option.effortLevels
-        guard !levels.isEmpty, let value = effectiveValue(for: option)?.string else { return nil }
+        let levels = effortLevels(for: option)
+        guard !levels.isEmpty, let value = displayedValue(for: option)?.string else { return nil }
         if value == "none" || value == "off" { return EffortDots(count: levels.count, lit: 0) }
         guard let index = levels.firstIndex(where: { $0.value == .string(value) }) else { return nil }
         return EffortDots(count: levels.count, lit: index + 1)
+    }
+
+    private func ultracodeChoice(for option: ComposerModelOption) -> ComposerModelOption.Choice? {
+        guard family == .claude, option.id == "effort" else { return nil }
+        return option.choices.first { $0.value == Self.ultracodeValue } ?? ultracodeToggle.map {
+            .init(value: Self.ultracodeValue, title: $0.title, description: $0.description)
+        }
+    }
+
+    private func displayedValue(for option: ComposerModelOption) -> Wire? {
+        if option.id == "effort", let toggle = ultracodeToggle, effectiveValue(for: toggle) == .bool(true) {
+            return Self.ultracodeValue
+        }
+        return effectiveValue(for: option)
     }
 
     private func effectiveValue(for option: ComposerModelOption) -> Wire? {
@@ -124,10 +171,22 @@ struct ComposerModelOptions: Equatable {
 
     func setting(_ value: Wire?, for id: String) -> Wire {
         guard var model = selection.object,
-              let descriptor = descriptors.first(where: { $0.id == id }),
-              value.map(descriptor.accepts) ?? true else { return selection }
+              let descriptor = descriptors.first(where: { $0.id == id }) else { return selection }
+        let mode = id == "effort" ? ultracode : nil
+        let selectingUltracode = mode != nil && value == Self.ultracodeValue
+        guard selectingUltracode || (value.map(descriptor.accepts) ?? true) else { return selection }
         var next = overrides
         next[id] = value
+        if let mode {
+            if selectingUltracode {
+                next[id] = mode.baseEffort
+                next[mode.toggle.id] = .bool(true)
+            } else if value == nil {
+                next[mode.toggle.id] = nil
+            } else if effectiveValue(for: mode.toggle) == .bool(true) {
+                next[mode.toggle.id] = .bool(false)
+            }
+        }
         guard next != overrides else { return selection }
         model["options"] = next.isEmpty ? nil : .array(next.sorted { $0.key < $1.key }.map { entry in
             .object(["id": .string(entry.key), "value": entry.value])

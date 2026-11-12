@@ -5,9 +5,12 @@ private final class PromptTextView: CitationTextView {
     var onSend: (() -> Void)?
     var onEditQueued: (() -> Bool)?
     var onSuggestionKey: ((NSEvent) -> Bool)?
+    var onCancelQueueEdit: (() -> Bool)?
 
     override func keyDown(with event: NSEvent) {
         if !hasMarkedText(), onSuggestionKey?(event) == true { return }
+        if event.keyCode == 53, event.modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty,
+           !hasMarkedText(), onCancelQueueEdit?() == true { return }
         if event.keyCode == 126, event.modifierFlags.intersection([.shift, .control, .option, .command]) == .option,
            !event.isARepeat, !hasMarkedText(), selectedRange() == NSRange(location: 0, length: 0),
            onEditQueued?() == true { return }
@@ -28,6 +31,17 @@ private final class PromptTextView: CitationTextView {
 
 @MainActor
 final class ComposerView: NSView, NSTextViewDelegate {
+    enum QueueEditState: Equatable {
+        case editing, saving, unavailable, failed(String)
+
+        var canSave: Bool {
+            switch self {
+            case .editing, .failed: true
+            case .saving, .unavailable: false
+            }
+        }
+    }
+
     struct Draft {
         var text = ""
         var model: Wire = .null
@@ -80,6 +94,14 @@ final class ComposerView: NSView, NSTextViewDelegate {
         WorkspaceStyle.icon("arrow.left.arrow.right", size: 11, tint: WorkspaceStyle.muted), activeModelLabel, NSView(), switchModel,
     ], spacing: 6)
     private let freshLabel = label("Next message starts a new session", size: 11.5, color: WorkspaceStyle.secondary)
+    private let queueEditTitle = label("Editing queued message", size: 11.5, weight: .medium, color: WorkspaceStyle.modelFocus)
+    private let queueEditNotice = label(size: 11.5, color: WorkspaceStyle.muted)
+    private lazy var cancelQueueEdit = ActionButton("Cancel Edit", symbol: "xmark", iconOnly: true, style: .subtle) {
+        [weak self] in _ = self?.cancelQueuedEdit()
+    }
+    private lazy var queueEditBar = row([
+        WorkspaceStyle.icon("pencil", size: 11, tint: WorkspaceStyle.modelFocus), queueEditTitle, NSView(), cancelQueueEdit,
+    ], spacing: 6)
     private lazy var freshBanner = row([
         WorkspaceStyle.icon("arrow.counterclockwise", size: 11), freshLabel, NSView(),
         ActionButton("Cancel Fresh Session", symbol: "xmark", iconOnly: true, style: .subtle) { [weak self] in
@@ -111,6 +133,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private var modelOptions = ComposerModelOptions()
     private var lastFallbackModel: Wire = .null
     private var draft = Draft()
+    private var queueEditState: QueueEditState?
     private var canSend = false
     private var isSending = false
     private var preparingAttachments = false
@@ -150,10 +173,14 @@ final class ComposerView: NSView, NSTextViewDelegate {
     var onModelChange: (() -> Void)?
     var onSwitchModel: ((Wire) -> Void)?
     var onEditQueued: (() -> Bool)?
+    var onSaveQueuedEdit: ((Draft) -> Void)?
+    var onCancelQueuedEdit: (() -> Void)?
     var loadCommandCatalog: (@MainActor (ComposerCommandScope) async throws -> ComposerCommandCatalog)?
     var currentDraft: Draft { draft }
     var selectedModelSelection: Wire { selectedModel }
-    var canDictate: Bool { canSend && !isSending }
+    var canDictate: Bool { canSend && !isSending && queueEditState == nil }
+    var canManageAttachments: Bool { canSend && !isSending && queueEditState?.canSave != false }
+    var canAttachFiles: Bool { canManageAttachments && !preparingAttachments }
     var voiceAnchor: VoiceDraftAnchor { .init(revision: draftRevision, range: editor.selectedRange()) }
     private var sendBlockReason: String?
 
@@ -178,6 +205,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
         editor.onSend = { [weak self] in self?.submit() }
         editor.onEditQueued = { [weak self] in self?.onEditQueued?() ?? false }
         editor.onSuggestionKey = { [weak self] event in self?.handleSuggestionKey(event) ?? false }
+        editor.onCancelQueueEdit = { [weak self] in self?.cancelQueuedEdit() ?? false }
         suggestions.onPick = { [weak self] item in self?.applySuggestion(item) }
         prompt.addSubview(placeholder)
         placeholder.translatesAutoresizingMaskIntoConstraints = false
@@ -231,7 +259,14 @@ final class ComposerView: NSView, NSTextViewDelegate {
         switchModel.setContentCompressionResistancePriority(.required, for: .horizontal)
         modelSwitchBar.isHidden = true
         modelSwitchBar.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        let stack = column([goalBar, modelSwitchBar, freshBanner, prompt, attachmentMenu, voiceBar, actions], spacing: 5, alignment: .width)
+        cancelQueueEdit.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        cancelQueueEdit.heightAnchor.constraint(equalToConstant: 21).isActive = true
+        queueEditBar.isHidden = true
+        queueEditNotice.maximumNumberOfLines = 2
+        queueEditNotice.lineBreakMode = .byWordWrapping
+        queueEditNotice.isHidden = true
+        let stack = column([goalBar, modelSwitchBar, freshBanner, queueEditBar, prompt, attachmentMenu, queueEditNotice, voiceBar, actions],
+                           spacing: 5, alignment: .width)
         fill(stack, in: shell, inset: 11)
 
         let location = row([WorkspaceStyle.icon("folder", size: 11, tint: WorkspaceStyle.muted), checkout, workspaceLabel], spacing: 5)
@@ -308,14 +343,42 @@ final class ComposerView: NSView, NSTextViewDelegate {
         checkout.isHidden = thread != nil
         workspaceLabel.isHidden = thread == nil
         workspaceLabel.stringValue = thread?.worktreePath == nil ? "Local checkout" : "Worktree"
-        runtime.isEnabled = canSend && !sending && !isWorking
-        interaction.isEnabled = canSend && !sending && !isWorking
         checkout.isEnabled = canSend && !sending
-        attach.isEnabled = canSend && !sending && !preparingAttachments
-        attachmentMenu.isEnabled = canSend && !sending && draft.hasAttachments
         placeholder.stringValue = isWorking ? "Queue a follow-up…" :
             thread == nil ? "Ask the agent to do something…" : "Continue the conversation…"
+        updateAttachments()
         updateSend()
+    }
+
+    func renderQueueEdit(_ state: QueueEditState?) {
+        guard queueEditState != state else { return }
+        queueEditState = state
+        queueEditBar.isHidden = state == nil
+        queueEditTitle.stringValue = state == .saving ? "Saving queued message…" : "Editing queued message"
+        cancelQueueEdit.isEnabled = state != .saving
+        let notice: String
+        switch state {
+        case .unavailable: notice = "This queued message is unavailable. You can copy your changes or cancel the edit."
+        case .failed(let error): notice = error
+        default: notice = ""
+        }
+        if case .failed = state { queueEditNotice.textColor = WorkspaceStyle.negative }
+        else { queueEditNotice.textColor = WorkspaceStyle.muted }
+        queueEditNotice.stringValue = notice
+        queueEditNotice.toolTip = notice
+        queueEditNotice.isHidden = notice.isEmpty
+        modelPicker.isHidden = state != nil
+        if state != nil { modelPicker.close(); modelSwitchBar.isHidden = true }
+        send.image = WorkspaceStyle.symbol(state == nil ? "arrow.up" : "checkmark", size: 13, weight: .semibold)
+        send.setAccessibilityLabel(state == nil ? "Send (↩)" : "Save Queued Message")
+        updateAttachments()
+        updateSend()
+    }
+
+    private func cancelQueuedEdit() -> Bool {
+        guard let queueEditState else { return false }
+        if queueEditState != .saving { onCancelQueuedEdit?() }
+        return true
     }
 
     func focus() { window?.makeFirstResponder(editor) }
@@ -420,7 +483,8 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     func renderModelSwitch(activeModel: Wire, canSwitch: @autoclosure () -> Bool) {
-        guard canSend, draft.model != .null, let change = catalog.modelSwitch(from: activeModel, to: selectedModel) else {
+        guard queueEditState == nil, canSend, draft.model != .null,
+              let change = catalog.modelSwitch(from: activeModel, to: selectedModel) else {
             modelSwitchBar.isHidden = true
             return
         }
@@ -460,6 +524,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     func addAttachments(_ files: [PickedAttachment]) throws {
+        guard queueEditState?.canSave != false else { throw ClientError.message("This queued message cannot be edited.") }
         try draft.addAttachments(files)
         onDraftChange?(draft)
         updateAttachments()
@@ -476,8 +541,8 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private func updateAttachments() {
         let count = draft.attachments.count + draft.retainedAttachments.count
         attachmentMenu.isHidden = count == 0 && !preparingAttachments
-        attachmentMenu.isEnabled = count > 0 && canSend && !isSending
-        attach.isEnabled = canSend && !isSending && !preparingAttachments
+        attachmentMenu.isEnabled = count > 0 && canManageAttachments
+        attach.isEnabled = canAttachFiles
         let first = BrowserAnnotationContext.attachmentLabel(
             draft.attachments.first?.name ?? draft.retainedAttachments.first?["name"].string ?? "Attachment"
         )
@@ -504,6 +569,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     @objc private func removeAttachment(_ sender: NSMenuItem) {
+        guard canManageAttachments else { return }
         if let id = sender.representedObject as? UUID { draft.attachments.removeAll { $0.id == id } }
         else if let id = sender.representedObject as? String {
             draft.retainedAttachments.removeAll { $0["id"].string == id }
@@ -521,7 +587,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     private func setModelOption(_ id: String, value: Wire?) {
-        guard canSend, !isSending else { return }
+        guard queueEditState == nil, canSend, !isSending else { return }
         let next = modelOptions.setting(value, for: id)
         guard next != selectedModel else { return }
         draft.model = next
@@ -531,7 +597,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     private func pickModel(_ next: Wire) {
-        guard canSend, !isSending, next != .null, next != selectedModel else { return }
+        guard queueEditState == nil, canSend, !isSending, next != .null, next != selectedModel else { return }
         draft.model = next
         updateModelPickers(next)
         onModelChange?()
@@ -552,6 +618,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
 
     func textDidChange(_ notification: Notification) {
         let text = editor.promptSource
+        if queueEditState != nil, !draft.text.isEmpty, text.isEmpty, !editor.hasMarkedText(), cancelQueuedEdit() { return }
         let records = draft.retainedContextRecords.filter { $0["kind"].string != "terminal" } + editor.terminalContextRecords
         if draft.text != text || draft.retainedContextRecords != records { draftRevision += 1 }
         draft.text = text
@@ -581,7 +648,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
             catalogFailed = false
             activeTrigger = nil
         }
-        guard canSend, !isSending, !voicePhase.busy, selectedModel != .null, editor.window?.firstResponder === editor,
+        guard queueEditState == nil, canSend, !isSending, !voicePhase.busy, selectedModel != .null, editor.window?.firstResponder === editor,
               !editor.hasMarkedText(),
               let trigger = ComposerCommandTrigger.detect(editor.string, caret: editor.selectedRange()) else {
             activeTrigger = nil
@@ -669,26 +736,37 @@ final class ComposerView: NSView, NSTextViewDelegate {
     }
 
     private func updateSend() {
-        placeholder.isHidden = !draft.text.isEmpty
-        let editable = canSend && !isSending && !voicePhase.busy
+        placeholder.isHidden = queueEditState != nil || !draft.text.isEmpty
+        let editable = canSend && !isSending && !voicePhase.busy && queueEditState != .saving
         if editor.isEditable != editable { editor.isEditable = editable }
         let hasContent = draft.hasAttachments || !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        send.isEnabled = canSend && sendBlockReason == nil && !isSending && !preparingAttachments && selectedModel != .null &&
-            (!draft.freshContext || freshAvailable) && (voicePhase == .recording || (!voicePhase.busy && hasContent))
-        if let sendBlockReason { send.toolTip = sendBlockReason }
-        else if preparingAttachments { send.toolTip = "Preparing attachments…" }
-        else if voicePhase == .recording { send.toolTip = "Finish dictation and send (↩)" }
-        else if voicePhase.busy { send.toolTip = "Waiting for dictation…" }
-        else { send.toolTip = isSending ? "Sending…" : isWorking ? "Queue message (↩)" : "Send (↩)" }
+        if let queueEditState {
+            send.isEnabled = editable && !preparingAttachments && queueEditState.canSave && hasContent
+            if queueEditState == .saving { send.toolTip = "Saving queued message…" }
+            else if preparingAttachments { send.toolTip = "Preparing attachments…" }
+            else { send.toolTip = "Save queued message (↩)" }
+        } else {
+            send.isEnabled = canSend && sendBlockReason == nil && !isSending && !preparingAttachments && selectedModel != .null &&
+                (!draft.freshContext || freshAvailable) && (voicePhase == .recording || (!voicePhase.busy && hasContent))
+            if let sendBlockReason { send.toolTip = sendBlockReason }
+            else if preparingAttachments { send.toolTip = "Preparing attachments…" }
+            else if voicePhase == .recording { send.toolTip = "Finish dictation and send (↩)" }
+            else if voicePhase.busy { send.toolTip = "Waiting for dictation…" }
+            else { send.toolTip = isSending ? "Sending…" : isWorking ? "Queue message (↩)" : "Send (↩)" }
+        }
+        let canChangeSettings = queueEditState == nil && canSend && !isSending
+        runtime.isEnabled = canChangeSettings && !isWorking
+        interaction.isEnabled = canChangeSettings && !isWorking
         modelPicker.render(catalog: catalog, selection: selectedModel, preferred: lastFallbackModel, options: modelOptions,
-                           enabled: canSend && !isSending, promptEffort: modelOptions.usesPromptEffort(draft.text))
-        freshBanner.isHidden = !draft.freshContext
+                           enabled: canChangeSettings, promptEffort: modelOptions.usesPromptEffort(draft.text))
+        freshBanner.isHidden = queueEditState != nil || !draft.freshContext
         freshLabel.stringValue = freshAvailable ? "Next message starts a new session" : "Fresh sessions are unavailable"
         refreshSuggestions()
     }
 
     private func submit() {
         guard send.isEnabled else { return }
+        if queueEditState != nil { onSaveQueuedEdit?(draft); return }
         if voicePhase == .recording { onVoiceSend?(); return }
         let command = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !draft.hasAttachments, command == "/clear", freshAvailable {

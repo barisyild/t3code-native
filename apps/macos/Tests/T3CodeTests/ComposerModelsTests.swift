@@ -61,25 +61,44 @@ struct ComposerModelsTests {
         #expect(catalog.options(for: only).setting(nil, for: "serviceTier")["options"] == .null)
     }
 
-    @Test func legacyClaudeEffortKeepsUltracodeAndPromptOnlyValuesStayOutOfTheMenu() throws {
-        let effort = select("effort", "Reasoning", values: [("high", "High"), ("xhigh", "Extra High"), ("ultrathink", "Ultrathink")],
+    @Test(arguments: ["xhigh", "high"])
+    func claudeUltracodeIsTheLastEffortAndUsesProviderOptions(_ base: String) throws {
+        let tiers = [("high", "High")] + (base == "xhigh" ? [("xhigh", "Extra High")] : [])
+        let effort = select("effort", "Reasoning", values: tiers + [("ultrathink", "Ultrathink")],
                             defaultValue: "high", promptValues: ["ultrathink"])
-        let ultracode: Wire = .object(["type": .string("boolean"), "id": .string("ultracode"), "label": .string("Ultracode")])
-        let catalog = ComposerModels(providers: [try instance("claude", driver: "claudeAgent", model: "Claude Opus", options: [effort, ultracode])])
+        let ultracode: Wire = .object([
+            "type": .string("boolean"), "id": .string("ultracode"), "label": .string("Ultracode"), "currentValue": .bool(true),
+        ])
+        let catalog = ComposerModels(providers: [try instance("work", driver: "claudeAgent", model: "Claude Opus", options: [effort, ultracode])])
+        let speed: Wire = .object(["id": .string("fastMode"), "value": .bool(true)])
         let existing: Wire = .object([
-            "instanceId": .string("claude"), "model": .string("alias"),
-            "options": .array([.object(["id": .string("effort"), "value": .string("ultracode")])]),
+            "instanceId": .string("work"), "model": .string("alias"),
+            "options": .array([.object(["id": .string("effort"), "value": .string("ultracode")]), speed]),
         ])
         let options = catalog.options(for: existing)
         let descriptor = try #require(options.reasoning)
-        #expect(options.title(for: descriptor) == "Extra High")
-        #expect(descriptor.choices.map(\.title) == ["High", "Extra High"])
+        #expect(options.title(for: descriptor) == "Ultracode")
+        #expect(options.choices(for: descriptor).map(\.value) == tiers.map { Wire.string($0.0) } + [.string("ultracode")])
+        #expect(options.override(for: descriptor) == .string("ultracode"))
+        #expect(options.effortDots(for: descriptor) == .init(count: tiers.count + 1, lit: tiers.count + 1))
         #expect(options.usesPromptEffort("Try ULTRATHINK today"))
         #expect(!options.usesPromptEffort("ultrathinking"))
         #expect(options.setting(.string("ultrathink"), for: "effort") == existing)
         let edited = options.setting(.string("high"), for: "effort")
-        #expect(edited["options"].array.contains(.object(["id": .string("ultracode"), "value": .bool(true)])))
+        #expect(edited["options"].array.contains(.object(["id": .string("ultracode"), "value": .bool(false)])))
         #expect(edited["model"].string == "alias")
+        let regular = catalog.options(for: edited)
+        #expect(regular.title(for: descriptor) == "High")
+        let enabled = regular.setting(.string("ultracode"), for: "effort")
+        #expect(enabled["options"].array == [
+            .object(["id": .string("effort"), "value": .string(base)]),
+            speed,
+            .object(["id": .string("ultracode"), "value": .bool(true)]),
+        ])
+        let reset = regular.setting(nil, for: "effort")
+        #expect(reset["options"].array == [speed])
+        #expect(catalog.options(for: reset).title(for: descriptor) == "Ultracode")
+        #expect(catalog.options(for: reset).override(for: descriptor) == nil)
     }
 
     @Test func claudeVersionsStayInTheirFamilyAndProviderInstance() throws {
@@ -149,19 +168,24 @@ struct ComposerModelsTests {
         let effort = try #require(ComposerModelOption(select(
             "effort", "Reasoning",
             values: [("default", "Default"), ("high", "High"), ("off", "Off"), ("medium", "Medium"),
-                     ("max", "Max"), ("low", "Low"), ("ultrathink", "Ultrathink")],
+                     ("ultracode", "Ultracode"), ("max", "Max"), ("low", "Low"), ("ultrathink", "Ultrathink")],
             defaultValue: "medium", promptValues: ["ultrathink"]
         )))
         let selection: Wire = .object(["instanceId": .string("claude"), "model": .string("opus")])
-        let options = ComposerModelOptions(selection: selection, descriptors: [effort])
-        #expect(options.effortDots(for: effort) == .init(count: 4, lit: 2))
-        for (tier, lit) in [("off", 0), ("low", 1), ("high", 3), ("max", 4)] {
-            let updated = ComposerModelOptions(selection: options.setting(.string(tier), for: "effort"), descriptors: [effort])
-            #expect(updated.effortDots(for: effort) == .init(count: 4, lit: lit))
+        let options = ComposerModelOptions(selection: selection, descriptors: [effort], family: .claude)
+        #expect(options.effortDots(for: effort) == .init(count: 5, lit: 2))
+        #expect(options.choices(for: effort).last?.value == .string("ultracode"))
+        for (tier, lit) in [("off", 0), ("low", 1), ("high", 3), ("max", 4), ("ultracode", 5)] {
+            let updated = ComposerModelOptions(selection: options.setting(.string(tier), for: "effort"),
+                                               descriptors: [effort], family: .claude)
+            #expect(updated.effortDots(for: effort) == .init(count: 5, lit: lit))
         }
-        let unresolved = ComposerModelOptions(selection: options.setting(.string("default"), for: "effort"), descriptors: [effort])
+        let unresolved = ComposerModelOptions(selection: options.setting(.string("default"), for: "effort"),
+                                              descriptors: [effort], family: .claude)
         #expect(unresolved.effortDots(for: effort) == nil)
         #expect(options.setting(.string("ultrathink"), for: "effort") == selection)
+        #expect(ComposerModelOptions(selection: selection, descriptors: [effort], family: .codex)
+            .effortDots(for: effort) == .init(count: 4, lit: 2))
     }
 
     private func instance(_ id: String, driver: String, model: String, options: [Wire] = []) throws -> Provider {

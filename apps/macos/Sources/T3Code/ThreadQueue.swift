@@ -41,6 +41,11 @@ struct ThreadQueue {
     enum Delivery: Equatable { case start, steer(String) }
     enum ModelSwitchDelivery: Equatable { case restart(String), interrupt(String) }
 
+    struct Reorder: Equatable {
+        let runID: String
+        let beforeRunID: String?
+    }
+
     struct State: Equatable {
         var messages: [QueuedMessage] = []
         var held = false
@@ -52,6 +57,13 @@ struct ThreadQueue {
             guard let activeRunID else { return .start }
             if canSteer && (!message.freshContext || skipsCompaction) { return .steer(activeRunID) }
             return nil
+        }
+
+        func reorder(moving runID: String, to insertionIndex: Int) -> Reorder? {
+            guard let source = messages.firstIndex(where: { $0.id == runID }),
+                  (0...messages.count).contains(insertionIndex),
+                  insertionIndex != source, insertionIndex != source + 1 else { return nil }
+            return Reorder(runID: runID, beforeRunID: insertionIndex == messages.count ? nil : messages[insertionIndex].id)
         }
     }
 

@@ -51,8 +51,10 @@ struct ComposerModels {
     }
 
     func options(for selection: Wire) -> ComposerModelOptions {
-        let model = provider(for: selection).flatMap { self.model(in: $0, for: selection) }
-        return ComposerModelOptions(selection: selection, descriptors: model?.options ?? [])
+        let instance = provider(for: selection)
+        let model = instance.flatMap { self.model(in: $0, for: selection) }
+        return ComposerModelOptions(selection: selection, descriptors: model?.options ?? [],
+                                    family: instance.flatMap { ComposerProvider(rawValue: $0.driver) })
     }
 
     func modelSwitch(from active: Wire, to selected: Wire) -> (activeTitle: String, selectedTitle: String)? {
