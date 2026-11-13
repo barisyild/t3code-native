@@ -11,6 +11,7 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
     }
 
     private lazy var trigger = ActionButton("Model settings", style: .subtle) { [weak self] in self?.toggle() }
+    private let popoverAnchor = NSView()
     private let options = ComposerOptionsView()
     private lazy var icons = Dictionary(uniqueKeysWithValues: ComposerProvider.allCases.map { ($0, WorkspaceStyle.providerIcon($0)) })
     private var catalog = ComposerModels(providers: [])
@@ -36,6 +37,14 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         trigger.heightAnchor.constraint(equalToConstant: 28).isActive = true
         trigger.widthAnchor.constraint(lessThanOrEqualToConstant: 192).isActive = true
         trigger.isEnabled = false
+        addSubview(popoverAnchor)
+        popoverAnchor.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            popoverAnchor.trailingAnchor.constraint(equalTo: trailingAnchor),
+            popoverAnchor.topAnchor.constraint(equalTo: topAnchor),
+            popoverAnchor.bottomAnchor.constraint(equalTo: bottomAnchor),
+            popoverAnchor.widthAnchor.constraint(equalToConstant: 24),
+        ])
         fill(trigger, in: self)
         options.onPick = { [weak self] id, value in self?.onPickOption?(id, value) }
         options.onBrowseModels = { [weak self] in self?.showModels() }
@@ -91,7 +100,7 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         self.popover = popover
         rendered = nil
         updateMenu()
-        popover.show(relativeTo: bounds, of: self, preferredEdge: .maxY)
+        popover.show(relativeTo: popoverAnchor.bounds, of: popoverAnchor, preferredEdge: .maxY)
     }
 
     func close() {
