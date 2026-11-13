@@ -13,6 +13,29 @@ struct ThreadGoal: Equatable, Sendable {
         var command: String { "/goal \(rawValue)" }
     }
 
+    static func editCommand(_ draft: String, driver: ComposerProvider) throws -> String {
+        let objective = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !objective.isEmpty else { throw ClientError.message("Enter a goal before saving.") }
+        guard !["clear", "pause", "resume", "edit", "show"].contains(objective.lowercased()) else {
+            throw ClientError.message("Enter a description of the goal.")
+        }
+        if driver == .codex, objective.unicodeScalars.count > 4_000 {
+            throw ClientError.message("Codex goals can contain up to 4,000 characters.")
+        }
+        return "/goal \(objective)"
+    }
+
+    struct Timing: Equatable {
+        let seconds: Int
+        let startedAt: Date?
+
+        func label(at now: Date) -> String {
+            let elapsed = startedAt.map { max(0, Int(now.timeIntervalSince($0))) } ?? 0
+            let (total, overflow) = seconds.addingReportingOverflow(elapsed)
+            return ThreadGoal.duration(overflow ? Int.max : total)
+        }
+    }
+
     struct Owner: Equatable, Sendable {
         let driver: ComposerProvider
         let instanceID: String
@@ -68,15 +91,32 @@ struct ThreadGoal: Equatable, Sendable {
     }
 
     var progress: String? {
+        if let timeUsedSeconds, timeUsedSeconds >= 0 { return Self.duration(timeUsedSeconds) }
+        return checkProgress
+    }
+
+    var checkProgress: String? {
+        checks.map { "\($0) \($0 == 1 ? "check" : "checks")" }
+    }
+
+    func timing(activeSince: Date?, providerUpdatedAt: Date? = nil) -> Timing? {
         if let timeUsedSeconds, timeUsedSeconds >= 0 {
-            let hours = timeUsedSeconds / 3600
-            let minutes = timeUsedSeconds / 60 % 60
-            let seconds = timeUsedSeconds % 60
-            if hours > 0 { return "\(hours)h \(minutes)m \(seconds)s" }
-            if minutes > 0 { return "\(minutes)m \(seconds)s" }
-            return "\(seconds)s"
+            let liveSince: Date? = if status == .active, let activeSince, let providerUpdatedAt {
+                max(activeSince, providerUpdatedAt)
+            } else { nil }
+            return .init(seconds: timeUsedSeconds, startedAt: liveSince)
         }
-        return checks.map { "\($0) \($0 == 1 ? "check" : "checks")" }
+        guard status == .active, let activeSince else { return nil }
+        return .init(seconds: 0, startedAt: activeSince)
+    }
+
+    private static func duration(_ value: Int) -> String {
+        let hours = value / 3600
+        let minutes = value / 60 % 60
+        let seconds = value % 60
+        if hours > 0 { return "\(hours)h \(minutes)m \(seconds)s" }
+        if minutes > 0 { return "\(minutes)m \(seconds)s" }
+        return "\(seconds)s"
     }
 
     func allows(_ action: Action, driver: ComposerProvider, working: Bool) -> Bool {

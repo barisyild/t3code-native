@@ -29,6 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private lazy var inspector = InspectorController(workspace: workspace)
     private lazy var sideChats = SideChatPanel(workspace: workspace)
     private lazy var relationships = ThreadRelationshipPanel(workspace: workspace)
+    private let goalEditor = ThreadGoalEditor()
+    private weak var goalEditorOwner: ConversationController?
     private lazy var scheduled = ScheduledTasksController(workspace: workspace)
     private lazy var pullRequests = PullRequestInboxController(workspace: workspace)
     private lazy var usage = UsageController(workspace: workspace)
@@ -333,6 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         conversation.onOpenSideChat = { [weak self] id in self?.openSideChatLink(id) ?? false }
         conversation.onRelatedConversations = { [weak self] in self?.showRelatedConversations() }
+        conversation.onToggleGoalEditor = { [weak self] owner in self?.toggleGoalEditor(for: owner) }
         conversation.onSideChatStarted = { [weak self] reference, model in
             guard let self else { return }
             sideChats.conversation.seedSideChatDraft(reference, model: model)
@@ -363,6 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         if change == .sideChat {
             syncSideChatPane(change)
+            syncGoalEditor()
             advanceCitationNavigation()
             return
         }
@@ -382,6 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         conversation.render(change)
         syncSideChatPane(change)
+        syncGoalEditor()
         advanceCitationNavigation()
         if relationshipsPresented {
             if workspace.selectedThread == nil { hideRelatedConversations() }
@@ -458,6 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 if page == .conversation {
                     conversation.refreshActivityTime()
                     if sideChatPresented { sideChats.conversation.refreshActivityTime() }
+                    if goalEditor.presentsGoal { goalEditor.refreshTime() }
                 }
             }
         }
@@ -487,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         file.addItem(menuItem("Sharing & Access…", target: self, action: #selector(openSharingAccess)))
         file.addItem(menuItem("Start Local Server", target: self, action: #selector(startLocalServer)))
         file.addItem(.separator())
-        file.addItem(menuItem("Save File", target: self, action: #selector(saveWorkspaceFile), key: "s"))
+        file.addItem(menuItem("Save", target: self, action: #selector(saveWorkspaceFile), key: "s"))
         file.addItem(NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
         addMenu("File", file, to: main)
 
@@ -579,7 +585,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return workspace.connection == .ready || sidebar.showsActivityOnly
         }
         return switch menuItem.action {
-        case #selector(saveWorkspaceFile): page == .conversation && inspector.canSaveCurrentFile
+        case #selector(saveWorkspaceFile):
+            page == .conversation && (goalEditor.presentsGoal ? goalEditor.canSave : inspector.canSaveCurrentFile)
         case #selector(startLocalServer): !localServer.isStarting
         case #selector(newThread), #selector(addProject): workspace.can("orchestration:operate")
         case #selector(newSideChat): page == .conversation && workspace.sideChatParent != nil
@@ -620,13 +627,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    @objc private func saveWorkspaceFile() { inspector.saveCurrentFile() }
+    @objc private func saveWorkspaceFile() {
+        if goalEditor.presentsGoal { goalEditor.saveObjective() }
+        else { inspector.saveCurrentFile() }
+    }
 
     @objc private func toggleSidebar() {
         guard let item = sidebarItem else { return }
         item.isCollapsed.toggle()
         rail.sidebarButton.isMarked = !item.isCollapsed
-        if sideChatPresented { fitAuxiliaryPane(356) }
+        if goalEditor.presentsGoal { fitAuxiliaryPane(320) }
+        else if sideChatPresented { fitAuxiliaryPane(356) }
         else if relationshipsPresented { fitAuxiliaryPane(318) }
     }
     @objc private func focusSearch() {
@@ -645,12 +656,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             return false
         }
         if inspectorItem?.isCollapsed == false, let responder = window.firstResponder as? NSView,
-           responder.isDescendant(of: inspector.view) { return false }
+           (responder.isDescendant(of: inspector.view) || (goalEditor.presentsGoal && responder.isDescendant(of: goalEditor.view))) { return false }
         return true
     }
 
     private var focusedConversation: ConversationController {
-        sideChatPresented && sideChats.conversation.containsFocus ? sideChats.conversation : conversation
+        if let goalEditorOwner { return goalEditorOwner }
+        return sideChatPresented && sideChats.conversation.containsFocus ? sideChats.conversation : conversation
     }
 
     @objc private func findInThread() { if canUseFindShortcut { focusedConversation.findInThread() } }
@@ -736,6 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         page = destination
         dismissViewedNotifications()
         if destination != .conversation {
+            hideGoalEditor()
             workspace.hideSideChat()
             hideRelatedConversations()
         }
@@ -900,6 +913,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             })
         }
         if page == .conversation, let thread = workspace.selectedThread {
+            if focusedConversation.goalPresentation != nil {
+                entries.append(.init(name: "Edit Goal…", detail: "Conversation", icon: "scope") { [weak self] in
+                    guard let self else { return }
+                    toggleGoalEditor(for: focusedConversation)
+                })
+            }
             entries += workspace.data.sideChats(of: thread.id).map { child in
                 .init(name: child.title, detail: "Side chat · \(thread.title)", icon: "bubble.left.and.bubble.right") { [weak self] in
                     _ = self?.openSideChatLink(child.id)
@@ -1000,7 +1019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private func toggleInspector(_ tab: InspectorController.Tab) {
         guard let item = inspectorItem else { return }
-        if !sideChatPresented, !relationshipsPresented, !item.isCollapsed, inspector.selectedTab == tab {
+        if !goalEditor.presentsGoal, !sideChatPresented, !relationshipsPresented, !item.isCollapsed, inspector.selectedTab == tab {
             item.isCollapsed = true
             inspector.hide()
             markInspector(nil)
@@ -1012,6 +1031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private func showInspector(_ tab: InspectorController.Tab, opening reference: WorkspaceFileReference? = nil) {
         guard let item = inspectorItem, inspector.canShow(tab) else { return }
         showWorkspace()
+        hideGoalEditor()
         workspace.hideSideChat()
         hideRelatedConversations()
         item.isCollapsed = false
@@ -1043,6 +1063,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         guard let item = inspectorItem else { return }
         if page == .conversation, workspace.sideChat != nil {
             if !sideChatPresented {
+                hideGoalEditor()
                 hideRelatedConversations()
                 if sideChats.parent == nil { installSideChatPane() }
                 inspector.hide()
@@ -1061,6 +1082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 sideChats.render(change)
             }
         } else if sideChatPresented {
+            hideGoalEditor()
             sideChatPresented = false
             sideChats.conversation.setWorkspaceVisible(false)
             sideChats.view.isHidden = true
@@ -1083,6 +1105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         sideChats.conversation.onVoiceSettings = conversation.onVoiceSettings
         sideChats.conversation.onOpenCitation = conversation.onOpenCitation
         sideChats.conversation.onOpenSideChat = conversation.onOpenSideChat
+        sideChats.conversation.onToggleGoalEditor = conversation.onToggleGoalEditor
         sideChats.conversation.onOpenWorkspaceFile = { [weak self] reference, context in
             guard let self, workspace.sideChat?.threadID == context.threadID,
                   workspace.environment?.id == context.environmentID, workspace.workspacePath == context.root else { return }
@@ -1103,12 +1126,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         window.setFrame(frame, display: true)
     }
 
+    private func toggleGoalEditor(for owner: ConversationController) {
+        guard page == .conversation, let presentation = owner.goalPresentation, let item = inspectorItem else { return }
+        if goalEditorOwner === owner {
+            hideGoalEditor()
+            owner.focusComposer()
+            return
+        }
+        hideGoalEditor()
+        hideRelatedConversations()
+        inspector.hide()
+        inspector.view.isHidden = true
+        markInspector(nil)
+        if goalEditor.parent == nil {
+            auxiliaryContent.addChild(goalEditor)
+            fill(goalEditor.view, in: auxiliaryContent.view)
+            goalEditor.onClose = { [weak self] in
+                let owner = self?.goalEditorOwner
+                self?.hideGoalEditor()
+                owner?.focusComposer()
+            }
+        }
+        goalEditorOwner = owner
+        owner.setGoalEditorPresented(true)
+        goalEditor.onSave = { [weak owner] previous, command in
+            guard let owner else { throw ClientError.disconnected }
+            try await owner.saveGoal(command, replacing: previous, target: presentation)
+        }
+        goalEditor.open(presentation)
+        goalEditor.view.isHidden = false
+        sideChats.view.isHidden = true
+        item.minimumThickness = 320
+        item.preferredThicknessFraction = 0.32
+        fitAuxiliaryPane(320)
+        item.isCollapsed = false
+        window.contentView?.layoutSubtreeIfNeeded()
+        goalEditor.focus()
+    }
+
+    private func syncGoalEditor() {
+        guard goalEditor.presentsGoal else { return }
+        if inspectorItem?.isCollapsed == true { hideGoalEditor(); return }
+        goalEditor.render(goalEditorOwner?.goalPresentation)
+    }
+
+    private func hideGoalEditor() {
+        guard goalEditor.presentsGoal, let item = inspectorItem else { return }
+        goalEditor.closeEditor()
+        goalEditor.view.isHidden = true
+        goalEditorOwner?.setGoalEditorPresented(false)
+        goalEditorOwner = nil
+        if sideChatPresented {
+            sideChats.view.isHidden = false
+            item.minimumThickness = 356
+            item.preferredThicknessFraction = 0.35
+            fitAuxiliaryPane(356)
+            item.isCollapsed = false
+        } else {
+            inspector.view.isHidden = false
+            item.isCollapsed = true
+            item.minimumThickness = 240
+            item.preferredThicknessFraction = 0.28
+            window.contentMinSize = NSSize(width: 690, height: 520)
+        }
+    }
+
     @objc private func showRelatedConversations() {
         guard page == .conversation, workspace.threadRelationshipScope != nil, let item = inspectorItem else { return }
         if relationshipsPresented {
             hideRelatedConversations()
             return
         }
+        hideGoalEditor()
         workspace.hideSideChat()
         inspector.hide()
         inspector.view.isHidden = true

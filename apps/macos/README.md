@@ -173,6 +173,7 @@ and workspace. Use the arrow keys to navigate and Return or Tab to accept.
 
 Send **/goal <objective>** with Codex or Claude to set a goal. The goal above the
 prompt shows its progress and lets you clear it or pause and resume a Codex goal.
+Use **Edit Goal** to revise the objective in the side panel. Saving starts work on the revised goal.
 
 Open **Side Chats** in the conversation toolbar or send **/side** with an optional
 prompt. **Bring Back** adds a finished side chat’s context to your next message in

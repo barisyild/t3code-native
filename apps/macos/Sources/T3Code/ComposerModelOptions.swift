@@ -125,8 +125,17 @@ struct ComposerModelOptions: Equatable {
     }
 
     func title(for option: ComposerModelOption) -> String {
+        choiceTitle(for: option) ?? option.title
+    }
+
+    func reasoningTitle(promptEffort: Bool) -> String? {
+        guard let reasoning else { return nil }
+        return promptEffort ? "Ultrathink" : choiceTitle(for: reasoning)
+    }
+
+    private func choiceTitle(for option: ComposerModelOption) -> String? {
         let value = displayedValue(for: option)
-        return choices(for: option).first { $0.value == value }?.title ?? option.title
+        return choices(for: option).first { $0.value == value }?.title
     }
 
     func choices(for option: ComposerModelOption) -> [ComposerModelOption.Choice] {

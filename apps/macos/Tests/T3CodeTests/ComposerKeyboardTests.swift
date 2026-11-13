@@ -29,6 +29,43 @@ struct ComposerKeyboardTests {
         #expect(editor.string.last?.isNewline == true)
     }
 
+    @Test func emptyRunningComposerOffersStopWithoutChangingWhatReturnDoes() throws {
+        let (window, composer, editor) = try composerWindow()
+        let thread = try #require(ThreadSummary(.object([
+            "id": .string("thread"), "projectId": .string("project"), "title": .string("Thread"),
+            "status": .string("running"), "activeRunId": .string("run"), "modelSelection": composer.currentDraft.model,
+        ])))
+        composer.render(providers: [], defaultModel: thread.model, thread: thread, checkout: .root(),
+                        projectAvailable: true, canOperate: true, sending: false)
+        var sent: [String] = []
+        var stopped = 0
+        composer.onSend = { sent.append($0.text) }
+        composer.onStop = { stopped += 1 }
+        let primary = try #require(button("Send (↩)", in: composer))
+        composer.renderStop(.available)
+        editor.insertText("", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        #expect(primary.isEnabled)
+        #expect(primary.accessibilityLabel() == "Stop Generation")
+        editor.keyDown(with: try returnEvent(window: window))
+        #expect(sent.isEmpty)
+        #expect(stopped == 0)
+        primary.performClick(nil)
+        #expect(stopped == 1)
+        composer.renderStop(.stopping)
+        #expect(!primary.isEnabled)
+        #expect(primary.accessibilityLabel() == "Stopping…")
+
+        editor.insertText("Follow-up", replacementRange: NSRange(location: 0, length: 0))
+        #expect(primary.isEnabled)
+        #expect(primary.toolTip == "Queue message (↩)")
+        editor.keyDown(with: try returnEvent(window: window))
+        #expect(sent == ["Follow-up"])
+        #expect(stopped == 1)
+
+        composer.renderQueueEdit(.editing)
+        #expect(primary.accessibilityLabel() == "Save Queued Message")
+    }
+
     @Test func mixedClipboardAttachmentsArePreparedBeforeReturnCanSend() async throws {
         let (window, composer, editor) = try composerWindow()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -185,6 +222,11 @@ struct ComposerKeyboardTests {
         let editor = try #require(window.firstResponder as? NSTextView)
         editor.setSelectedRange(NSRange(location: editor.string.utf16.count, length: 0))
         return (window, composer, editor)
+    }
+
+    private func button(_ name: String, in view: NSView) -> ActionButton? {
+        if let button = view as? ActionButton, button.accessibilityLabel() == name { return button }
+        return view.subviews.lazy.compactMap { button(name, in: $0) }.first
     }
 
     private func returnEvent(window: NSWindow, keyCode: UInt16 = 36,

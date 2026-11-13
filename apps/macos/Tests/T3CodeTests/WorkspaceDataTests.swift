@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import T3Code
 
@@ -191,8 +192,18 @@ struct WorkspaceDataTests {
                                         "timeUsedSeconds": .int(12_510)]), at: 1))
         #expect(workspace.threads["thread"]?.goal?.status == .active)
         #expect(workspace.threads["thread"]?.goal?.progress == "3h 28m 30s")
+        let start = Date(timeIntervalSince1970: 1_000)
+        let now = start.addingTimeInterval(95)
+        let sample = start.addingTimeInterval(60)
+        let timing = workspace.threads["thread"]?.goal?.timing(activeSince: start, providerUpdatedAt: sample)
+        #expect(timing?.label(at: now) == "3h 29m 5s")
+        #expect(workspace.threads["thread"]?.goal?.timing(activeSince: nil, providerUpdatedAt: sample)?.label(at: now) == "3h 28m 30s")
+        let claude = ThreadGoal(.object(["objective": .string("Finish the port"), "status": .string("active"), "checks": .int(0)]))
+        #expect(claude?.timing(activeSince: start)?.label(at: now) == "1m 35s")
+        #expect(claude?.timing(activeSince: nil) == nil)
         workspace.apply(update(.object(["objective": .string("Finish the port"), "status": .string("paused")]), at: 2))
         #expect(workspace.threads["thread"]?.goal?.status == .paused)
+        #expect(workspace.threads["thread"]?.goal?.timing(activeSince: start) == nil)
         workspace.apply(update(.null, at: 3))
         #expect(workspace.threads["thread"]?.goal == nil)
     }
@@ -200,19 +211,40 @@ struct WorkspaceDataTests {
     @Test func goalCommandsUseTheProviderThreadEvenWhenTheSelectedModelDiffers() throws {
         let codexModel: Wire = .object(["instanceId": .string("managed-codex"), "model": .string("gpt-codex")])
         let claudeModel: Wire = .object(["instanceId": .string("claude"), "model": .string("claude-opus")])
+        let goalWire: Wire = .object(["objective": .string("Ship the fix"), "status": .string("active"), "timeUsedSeconds": .int(18)])
+        let goal = try #require(ThreadGoal(goalWire))
         var detail = ThreadDetail()
         detail.apply(.object([
             "kind": .string("snapshot"), "snapshotSequence": .int(1),
             "projection": .object(["providerThreads": .array([.object([
                 "id": .string("codex-thread"), "driver": .string("codex"), "providerInstanceId": .string("managed-codex"),
                 "nativeMetadata": .object(["modelSelection": codexModel]),
+                "goal": goalWire,
+                "updatedAt": .string("2026-11-13T01:00:00Z"),
             ])])]),
         ]))
         let owner = try #require(detail.goalOwners["codex-thread"])
         #expect(owner.commandModel(threadModel: claudeModel, providers: []) == codexModel)
+        let reportedAt = try #require(detail.goalTimeUpdatedAt(for: goal, providerThreadID: "codex-thread"))
+        detail.apply(event("provider-thread.updated", .object([
+            "id": .string("codex-thread"), "driver": .string("codex"), "providerInstanceId": .string("managed-codex"),
+            "goal": goalWire,
+            "updatedAt": .string("2026-11-13T01:00:15Z"),
+        ]), sequence: 2))
+        #expect(detail.goalTimeUpdatedAt(for: goal, providerThreadID: "codex-thread") == reportedAt)
+        let newerGoal = try #require(ThreadGoal(.object([
+            "objective": .string("Ship the fix"), "status": .string("active"), "timeUsedSeconds": .int(35),
+        ])))
+        #expect(detail.goalTimeUpdatedAt(for: newerGoal, providerThreadID: "codex-thread") == nil)
+        detail.apply(event("provider-thread.updated", .object([
+            "id": .string("codex-thread"), "driver": .string("codex"), "providerInstanceId": .string("managed-codex"),
+            "goal": .object(["objective": .string("Ship the fix"), "status": .string("active"), "timeUsedSeconds": .int(35)]),
+            "updatedAt": .string("2026-11-13T01:00:17Z"),
+        ]), sequence: 3))
+        #expect(detail.goalTimeUpdatedAt(for: newerGoal, providerThreadID: "codex-thread") == reportedAt.addingTimeInterval(17))
         detail.apply(event("provider-thread.updated", .object([
             "id": .string("claude-thread"), "driver": .string("claudeAgent"), "providerInstanceId": .string("claude"),
-        ]), sequence: 2))
+        ]), sequence: 4))
         #expect(detail.goalOwners["claude-thread"]?.commandModel(threadModel: claudeModel, providers: []) == claudeModel)
         #expect(detail.goalOwners["claude-thread"]?.commandModel(threadModel: codexModel, providers: []) == nil)
         let paused = try #require(ThreadGoal(.object(["objective": .string("Ship the fix"), "status": .string("paused")])))
@@ -220,6 +252,17 @@ struct WorkspaceDataTests {
         #expect(!paused.allows(.resume, driver: .codex, working: true))
         #expect(!paused.allows(.resume, driver: .claude, working: false))
         #expect(paused.allows(.clear, driver: .claude, working: false))
+    }
+
+    @Test func editingAGoalCannotSendAGoalControlCommand() throws {
+        #expect(try ThreadGoal.editCommand("  Fix the parser\nKeep the public API.  ", driver: .codex) ==
+            "/goal Fix the parser\nKeep the public API.")
+        for objective in ["", "  CLEAR  ", "pause", "ReSuMe", "edit", "show"] {
+            #expect(throws: ClientError.self) { try ThreadGoal.editCommand(objective, driver: .claude) }
+        }
+        #expect(throws: ClientError.self) {
+            try ThreadGoal.editCommand(String(repeating: "x", count: 4_001), driver: .codex)
+        }
     }
 
     @Test func historyPageKeepsNewerStreamedMessage() {

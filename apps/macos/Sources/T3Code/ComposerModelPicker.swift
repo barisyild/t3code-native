@@ -56,14 +56,22 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         self.promptEffort = promptEffort
         let family = catalog.family(for: selection)
         let name = catalog.pickerTitle(for: selection) ?? "Select model"
-        let title = name + "  ⌄"
-        if trigger.title != title { trigger.title = title }
+        let effort = options.reasoningTitle(promptEffort: promptEffort)
+        let value = [name, effort].compactMap { $0 }.joined(separator: " ")
+        let available = enabled && (selection != .null || ComposerProvider.allCases.contains(where: catalog.isAvailable))
+        let title = NSMutableAttributedString(string: name, attributes: [
+            .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+            .foregroundColor: available ? WorkspaceStyle.ink : WorkspaceStyle.muted,
+        ])
+        title.append(NSAttributedString(string: effort.map { " \($0)  ⌄" } ?? "  ⌄", attributes: [
+            .font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: WorkspaceStyle.muted,
+        ]))
+        if !trigger.attributedTitle.isEqual(to: title) { trigger.attributedTitle = title }
         let icon = family.flatMap { icons[$0] } ?? WorkspaceStyle.symbol("cpu", size: 14)
         if trigger.image !== icon { trigger.image = icon }
-        trigger.toolTip = family.map { "\($0.title) · \(name)" } ?? name
-        trigger.setAccessibilityLabel("Model settings")
-        trigger.setAccessibilityValue(name)
-        trigger.isEnabled = enabled && (selection != .null || ComposerProvider.allCases.contains(where: catalog.isAvailable))
+        trigger.toolTip = family.map { "\($0.title) · \(value)" } ?? value
+        trigger.setAccessibilityValue(value)
+        trigger.isEnabled = available
         if !canOpen { close() }
         else if popover?.isShown == true { updateMenu() }
     }
@@ -112,7 +120,8 @@ final class ComposerModelPicker: NSView, NSPopoverDelegate {
         if !showingModels {
             options.render(modelOptions, modelName: catalog.pickerTitle(for: selection) ?? "Select model",
                            provider: current, icon: current.flatMap { icons[$0] } ?? trigger.image ?? NSImage(),
-                           canBrowseProviders: !available.isEmpty, enabled: canOpen, promptEffort: promptEffort)
+                           canBrowseProviders: !available.isEmpty, enabled: canOpen, promptEffort: promptEffort,
+                           effortContext: modelWithoutOptions(selection))
             let content = controller.view
             let inset: CGFloat = 9
             if options.superview !== content {

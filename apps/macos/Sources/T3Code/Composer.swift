@@ -42,6 +42,31 @@ final class ComposerView: NSView, NSTextViewDelegate {
         }
     }
 
+    enum StopState: Equatable {
+        case unavailable, available, stopping
+    }
+
+    private enum PrimaryAction {
+        case send, save, stop, stopping
+
+        var symbol: String {
+            switch self {
+            case .send: "arrow.up"
+            case .save: "checkmark"
+            case .stop, .stopping: "stop.fill"
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .send: "Send (↩)"
+            case .save: "Save Queued Message"
+            case .stop: "Stop Generation"
+            case .stopping: "Stopping…"
+            }
+        }
+    }
+
     struct Draft {
         var text = ""
         var model: Wire = .null
@@ -117,9 +142,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private lazy var branch = ActionButton("Branch", symbol: "arrow.triangle.branch", style: .subtle) { [weak self] in
         self?.onBranch?()
     }
-    private lazy var permissionControl = row([WorkspaceStyle.icon("lock", size: 12), runtime], spacing: 3)
+    private let permissionIcon = WorkspaceStyle.icon("lock.shield", size: 13, tint: WorkspaceStyle.muted)
+    private lazy var permissionControl = row([permissionIcon, runtime], spacing: 3)
     private lazy var modeControl = row([WorkspaceStyle.icon("hammer", size: 12), interaction], spacing: 3)
-    private lazy var attach = ActionButton("Attach Files…", symbol: "paperclip", iconOnly: true, style: .subtle) { [weak self] in self?.onAttach?() }
+    private lazy var attach = ActionButton("Attach Files…", symbol: "plus", iconOnly: true, style: .subtle) { [weak self] in self?.onAttach?() }
     private lazy var voice = ActionButton("Start Dictation", symbol: "mic", iconOnly: true, style: .subtle) { [weak self] in self?.onVoiceToggle?() }
     private lazy var cancelVoice = ActionButton("Cancel Dictation", symbol: "xmark", iconOnly: true, style: .subtle) { [weak self] in self?.onVoiceCancel?() }
     private let voiceStatus = label(size: 11.5, weight: .medium, color: WorkspaceStyle.muted)
@@ -127,7 +153,9 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private lazy var voiceSettings = ActionButton("Voice Settings…", style: .subtle) { [weak self] in self?.onVoiceSettings?() }
     private lazy var voiceBar = row([voiceStatus, voicePreview, NSView(), voiceSettings], spacing: 7)
     private lazy var attachmentMenu = ActionButton("Attachments", symbol: "paperclip", style: .subtle) { [weak self] in self?.showAttachments() }
-    private lazy var send = ActionButton("Send (↩)", symbol: "arrow.up", iconOnly: true, style: .send) { [weak self] in self?.submit() }
+    private lazy var send = ActionButton(PrimaryAction.send.label, iconOnly: true, style: .send) { [weak self] in
+        self?.activatePrimaryAction()
+    }
     private var selectedModel: Wire = .null
     private var catalog = ComposerModels(providers: [])
     private var modelOptions = ComposerModelOptions()
@@ -138,6 +166,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private var isSending = false
     private var preparingAttachments = false
     private var isWorking = false
+    private var threadRuntime: String?
+    private var stopState = StopState.unavailable
+    private var primaryAction = PrimaryAction.send
+    private var submissionEnabled = false
     private var commandConnection: UUID?
     private var commandCwd: String?
     private var commandHistory = false
@@ -151,9 +183,11 @@ final class ComposerView: NSView, NSTextViewDelegate {
     private var dismissedTrigger: ComposerCommandTrigger?
     private var promptHeight: NSLayoutConstraint?
     private var lastPromptWidth: CGFloat = 0
+    private var compactPermissions = false
     private var voicePhase = VoiceDictation.Phase.idle
     private var draftRevision = 0
     var onSend: ((Draft) -> Void)?
+    var onStop: (() -> Void)?
     var onDraftChange: ((Draft) -> Void)?
     var onModeChange: ((String, String) -> Void)?
     var onWorktree: (() -> Void)?
@@ -229,6 +263,9 @@ final class ComposerView: NSView, NSTextViewDelegate {
             picker.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
         runtime.setAccessibilityLabel("Permissions")
+        runtime.cell?.lineBreakMode = .byTruncatingTail
+        permissionIcon.widthAnchor.constraint(equalToConstant: 15).isActive = true
+        permissionControl.widthAnchor.constraint(lessThanOrEqualToConstant: 156).isActive = true
         interaction.setAccessibilityLabel("Interaction Mode")
         checkout.setAccessibilityLabel("Workspace")
         checkout.cell?.lineBreakMode = .byTruncatingTail
@@ -236,7 +273,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
         for picker in [runtime, interaction, checkout] {
             picker.font = .systemFont(ofSize: 11.5)
         }
-        send.image = WorkspaceStyle.symbol("arrow.up", size: 13, weight: .semibold)
+        runtime.font = .systemFont(ofSize: 12.5)
+        runtime.contentTintColor = WorkspaceStyle.muted
+        send.image = WorkspaceStyle.symbol(PrimaryAction.send.symbol, size: 13, weight: .semibold)
+        send.imagePosition = .imageOnly
         send.widthAnchor.constraint(equalToConstant: 31).isActive = true
         send.heightAnchor.constraint(equalToConstant: 31).isActive = true
         attach.widthAnchor.constraint(equalToConstant: 27).isActive = true
@@ -252,7 +292,9 @@ final class ComposerView: NSView, NSTextViewDelegate {
         voiceBar.isHidden = true
         voiceStatus.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         voicePreview.lineBreakMode = .byTruncatingHead
-        let actions = row([modelPicker, NSView(), attach, cancelVoice, voice, send], spacing: 10)
+        let leftActions = row([attach, permissionControl], spacing: 7)
+        let rightActions = row([modelPicker, cancelVoice, voice, send], spacing: 8)
+        let actions = row([leftActions, NSView(), rightActions], spacing: 8)
         freshBanner.isHidden = true
         freshBanner.heightAnchor.constraint(equalToConstant: 21).isActive = true
         switchModel.font = .systemFont(ofSize: 11.5, weight: .medium)
@@ -272,8 +314,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
         let location = row([WorkspaceStyle.icon("folder", size: 11, tint: WorkspaceStyle.muted), checkout, workspaceLabel], spacing: 5)
         branch.font = .systemFont(ofSize: 11.5)
         branch.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = row([location, NSView(), permissionControl, modeControl, branch, usageLimits], spacing: 8)
-        runtime.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        let footer = row([location, NSView(), modeControl, branch, usageLimits], spacing: 8)
         interaction.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         footer.heightAnchor.constraint(equalToConstant: 22).isActive = true
         let panel = column([suggestions, shell, footer], spacing: 5, alignment: .width)
@@ -290,6 +331,11 @@ final class ComposerView: NSView, NSTextViewDelegate {
         if abs(editor.bounds.width - lastPromptWidth) > 1 {
             lastPromptWidth = editor.bounds.width
             updatePromptHeight()
+        }
+        let compact = bounds.width < 390
+        if compactPermissions != compact {
+            compactPermissions = compact
+            updatePermissionIcon()
         }
     }
 
@@ -318,15 +364,11 @@ final class ComposerView: NSView, NSTextViewDelegate {
         canSend = canOperate && projectAvailable && thread?.archived != true
         isSending = sending
         isWorking = thread?.isWorking == true
+        threadRuntime = thread?.runtimeMode
         let current = catalog.initialSelection(draft: draft.model, fallback: defaultModel, existingThread: thread != nil)
         updateModelPickers(current)
         let provider = catalog.provider(for: current)
-        let modes = [("approval-required", "Ask for approval"), ("auto-accept-edits", "Auto-accept edits"),
-                     ("auto", "Auto"), ("full-access", "Full access")]
-        let supported = provider?.modes ?? ["approval-required", "auto-accept-edits", "auto", "full-access"]
-        let available = modes.filter { supported.contains($0.0) || $0.0 == thread?.runtimeMode }
-        configure(runtime, values: available, selection: draft.runtime ?? thread?.runtimeMode ?? "approval-required")
-        permissionControl.isHidden = available.isEmpty
+        configurePermissions(provider: provider)
         configure(interaction, values: [("default", "Agent"), ("plan", "Plan")], selection: draft.interaction ?? thread?.interactionMode)
         modeControl.isHidden = provider?.supportsPlan != true && thread?.interactionMode != "plan"
         let selectedCheckout: String
@@ -369,9 +411,13 @@ final class ComposerView: NSView, NSTextViewDelegate {
         queueEditNotice.isHidden = notice.isEmpty
         modelPicker.isHidden = state != nil
         if state != nil { modelPicker.close(); modelSwitchBar.isHidden = true }
-        send.image = WorkspaceStyle.symbol(state == nil ? "arrow.up" : "checkmark", size: 13, weight: .semibold)
-        send.setAccessibilityLabel(state == nil ? "Send (↩)" : "Save Queued Message")
         updateAttachments()
+        updateSend()
+    }
+
+    func renderStop(_ state: StopState) {
+        guard stopState != state else { return }
+        stopState = state
         updateSend()
     }
 
@@ -600,13 +646,15 @@ final class ComposerView: NSView, NSTextViewDelegate {
         guard queueEditState == nil, canSend, !isSending, next != .null, next != selectedModel else { return }
         draft.model = next
         updateModelPickers(next)
+        configurePermissions(provider: catalog.provider(for: next))
         onModelChange?()
         onDraftChange?(draft)
         updateSend()
     }
 
     private func configure(_ button: NSPopUpButton, values: [(String, String)], selection: String?) {
-        if button.itemArray.compactMap({ $0.representedObject as? String }) != values.map(\.0) {
+        if button.itemArray.compactMap({ $0.representedObject as? String }) != values.map(\.0) ||
+            button.itemTitles != values.map(\.1) {
             button.removeAllItems()
             for (value, title) in values {
                 button.addItem(withTitle: title)
@@ -614,6 +662,34 @@ final class ComposerView: NSView, NSTextViewDelegate {
             }
         }
         if !values.isEmpty { button.selectItem(at: values.firstIndex(where: { $0.0 == selection }) ?? 0) }
+    }
+
+    private func configurePermissions(provider: Provider?) {
+        let auto = catalog.family(for: selectedModel) == .codex ? "Approve for me" : "Auto"
+        let modes = [("approval-required", "Ask for approval"), ("auto-accept-edits", "Auto-accept edits"),
+                     ("auto", auto), ("full-access", "Full access")]
+        let supported = provider?.modes ?? modes.map(\.0)
+        let available = modes.filter { supported.contains($0.0) || $0.0 == threadRuntime }
+        configure(runtime, values: available, selection: draft.runtime ?? threadRuntime ?? "approval-required")
+        permissionControl.isHidden = available.isEmpty
+        updatePermissionIcon()
+    }
+
+    private func updatePermissionIcon() {
+        let symbol = switch runtime.selectedItem?.representedObject as? String {
+        case "auto": "checkmark.shield"
+        case "auto-accept-edits": "pencil"
+        case "full-access": "lock.open"
+        default: "lock.shield"
+        }
+        let icon = WorkspaceStyle.symbol(symbol, size: 13)
+        permissionIcon.image = icon
+        permissionIcon.isHidden = compactPermissions
+        runtime.imagePosition = compactPermissions ? .imageOnly : .imageLeading
+        for item in runtime.itemArray { item.image = compactPermissions ? icon : nil }
+        let name = runtime.titleOfSelectedItem
+        runtime.toolTip = name
+        runtime.setAccessibilityValue(name)
     }
 
     func textDidChange(_ notification: Notification) {
@@ -740,22 +816,10 @@ final class ComposerView: NSView, NSTextViewDelegate {
         let editable = canSend && !isSending && !voicePhase.busy && queueEditState != .saving
         if editor.isEditable != editable { editor.isEditable = editable }
         let hasContent = draft.hasAttachments || !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if let queueEditState {
-            send.isEnabled = editable && !preparingAttachments && queueEditState.canSave && hasContent
-            if queueEditState == .saving { send.toolTip = "Saving queued message…" }
-            else if preparingAttachments { send.toolTip = "Preparing attachments…" }
-            else { send.toolTip = "Save queued message (↩)" }
-        } else {
-            send.isEnabled = canSend && sendBlockReason == nil && !isSending && !preparingAttachments && selectedModel != .null &&
-                (!draft.freshContext || freshAvailable) && (voicePhase == .recording || (!voicePhase.busy && hasContent))
-            if let sendBlockReason { send.toolTip = sendBlockReason }
-            else if preparingAttachments { send.toolTip = "Preparing attachments…" }
-            else if voicePhase == .recording { send.toolTip = "Finish dictation and send (↩)" }
-            else if voicePhase.busy { send.toolTip = "Waiting for dictation…" }
-            else { send.toolTip = isSending ? "Sending…" : isWorking ? "Queue message (↩)" : "Send (↩)" }
-        }
+        updatePrimaryAction(hasContent: hasContent, editable: editable)
         let canChangeSettings = queueEditState == nil && canSend && !isSending
         runtime.isEnabled = canChangeSettings && !isWorking
+        permissionIcon.alphaValue = runtime.isEnabled ? 1 : 0.55
         interaction.isEnabled = canChangeSettings && !isWorking
         modelPicker.render(catalog: catalog, selection: selectedModel, preferred: lastFallbackModel, options: modelOptions,
                            enabled: canChangeSettings, promptEffort: modelOptions.usesPromptEffort(draft.text))
@@ -764,8 +828,46 @@ final class ComposerView: NSView, NSTextViewDelegate {
         refreshSuggestions()
     }
 
-    private func submit() {
+    private func updatePrimaryAction(hasContent: Bool, editable: Bool) {
+        let action: PrimaryAction
+        let tooltip: String
+        if let queueEditState {
+            action = .save
+            submissionEnabled = editable && !preparingAttachments && queueEditState.canSave && hasContent
+            if queueEditState == .saving { tooltip = "Saving queued message…" }
+            else if preparingAttachments { tooltip = "Preparing attachments…" }
+            else { tooltip = "Save queued message (↩)" }
+        } else if !hasContent, !isSending, !preparingAttachments, !voicePhase.busy, stopState != .unavailable {
+            action = stopState == .stopping ? .stopping : .stop
+            submissionEnabled = false
+            tooltip = action.label
+        } else {
+            action = .send
+            submissionEnabled = canSend && sendBlockReason == nil && !isSending && !preparingAttachments && selectedModel != .null &&
+                (!draft.freshContext || freshAvailable) && (voicePhase == .recording || (!voicePhase.busy && hasContent))
+            if let sendBlockReason { tooltip = sendBlockReason }
+            else if preparingAttachments { tooltip = "Preparing attachments…" }
+            else if voicePhase == .recording { tooltip = "Finish dictation and send (↩)" }
+            else if voicePhase.busy { tooltip = "Waiting for dictation…" }
+            else { tooltip = isSending ? "Sending…" : isWorking ? "Queue message (↩)" : action.label }
+        }
+        if primaryAction != action {
+            primaryAction = action
+            send.image = WorkspaceStyle.symbol(action.symbol, size: 13, weight: .semibold)
+            send.setAccessibilityLabel(action.label)
+        }
+        send.isEnabled = action == .stop || submissionEnabled
+        send.toolTip = tooltip
+    }
+
+    private func activatePrimaryAction() {
         guard send.isEnabled else { return }
+        if primaryAction == .stop { onStop?() }
+        else { submit() }
+    }
+
+    private func submit() {
+        guard submissionEnabled else { return }
         if queueEditState != nil { onSaveQueuedEdit?(draft); return }
         if voicePhase == .recording { onVoiceSend?(); return }
         let command = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -795,6 +897,7 @@ final class ComposerView: NSView, NSTextViewDelegate {
         } else if let value = sender.selectedItem?.representedObject as? String {
             if sender === runtime {
                 draft.runtime = value
+                updatePermissionIcon()
                 onModeChange?("runtimeMode", value)
             } else {
                 draft.interaction = value

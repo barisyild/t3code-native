@@ -18,15 +18,14 @@ final class ComposerOptionsView: NSStackView {
         guard let self else { return }
         onBrowseProviders?(providerButton)
     }
-    private lazy var readout = ActionButton("Effort", style: .subtle) { [weak self] in
-        self?.showEffortMenu()
-    }
+    private lazy var readout = EffortReadout { [weak self] in self?.showEffortMenu() }
     private lazy var modelButton = ActionButton("Choose model", style: .subtle) { [weak self] in
         self?.onBrowseModels?()
     }
     private var model = ComposerModelOptions()
     private var enabled = false
     private var promptEffort = false
+    private var effortContext: Wire = .null
     var onPick: ((String, Wire?) -> Void)?
     var onBrowseModels: (() -> Void)?
     var onBrowseProviders: ((NSView) -> Void)?
@@ -45,13 +44,11 @@ final class ComposerOptionsView: NSStackView {
         speed.imagePosition = .imageOnly
         (speed.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
         providerButton.imagePosition = .imageOnly
-        readout.font = .systemFont(ofSize: 14, weight: .medium)
         modelButton.font = .systemFont(ofSize: 12)
         modelButton.image = WorkspaceStyle.symbol("chevron.right", size: 8, weight: .medium)
         modelButton.imagePosition = .imageTrailing
         modelButton.cell?.lineBreakMode = .byTruncatingTail
         modelButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        readout.cell?.lineBreakMode = .byTruncatingTail
         readout.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         for button in [providerButton as NSView, speed] {
             button.widthAnchor.constraint(equalToConstant: 24).isActive = true
@@ -94,7 +91,7 @@ final class ComposerOptionsView: NSStackView {
     required init?(coder: NSCoder) { fatalError() }
 
     func render(_ next: ComposerModelOptions, modelName: String, provider: ComposerProvider?, icon: NSImage,
-                canBrowseProviders: Bool, enabled: Bool, promptEffort: Bool) {
+                canBrowseProviders: Bool, enabled: Bool, promptEffort: Bool, effortContext: Wire) {
         if modelButton.title != modelName { modelButton.title = modelName }
         modelButton.toolTip = modelName
         modelButton.setAccessibilityValue(modelName)
@@ -102,11 +99,13 @@ final class ComposerOptionsView: NSStackView {
         if providerButton.image !== icon { providerButton.image = icon }
         providerButton.setAccessibilityValue(provider?.title)
         providerButton.isEnabled = enabled && canBrowseProviders
-        guard model != next || self.enabled != enabled || self.promptEffort != promptEffort else { return }
+        let contextChanged = self.effortContext != effortContext
+        guard contextChanged || model != next || self.enabled != enabled || self.promptEffort != promptEffort else { return }
         model = next
         self.enabled = enabled
         self.promptEffort = promptEffort
-        renderEffort()
+        self.effortContext = effortContext
+        renderEffort(animated: !contextChanged)
         renderSpeed()
     }
 
@@ -120,26 +119,26 @@ final class ComposerOptionsView: NSStackView {
     }
 
     private func title(for option: ComposerModelOption) -> String {
-        isPromptControlled(option) ? "Ultrathink" : model.title(for: option)
+        isPromptControlled(option) ? (model.reasoningTitle(promptEffort: true) ?? option.title) : model.title(for: option)
     }
 
-    private func renderEffort() {
+    private func renderEffort(animated: Bool) {
         readout.isHidden = model.reasoning == nil
         headerHeight.constant = readout.isHidden ? 27 : 40
         guard let option = model.reasoning else { slider.isHidden = true; return }
         let title = title(for: option)
         let locked = isPromptControlled(option)
-        readout.title = title
-        readout.contentTintColor = locked ? WorkspaceStyle.secondary : WorkspaceStyle.modelFocus
-        readout.setAccessibilityValue(title)
+        let levels = model.effortLevels(for: option)
+        let lit = model.effortDots(for: option)?.lit ?? 0
         readout.toolTip = locked ? "Ultrathink is set by your prompt." : option.description
+        readout.render(title, levels: locked || lit == 0 ? [] : levels.map(\.title),
+                       index: max(0, lit - 1), color: locked ? WorkspaceStyle.secondary : WorkspaceStyle.modelFocus,
+                       animated: animated)
         readout.isEnabled = enabled && (!locked || !extraOptions.isEmpty)
 
-        let levels = model.effortLevels(for: option)
         slider.isHidden = locked || levels.count < 2
         guard !slider.isHidden else { return }
-        let lit = model.effortDots(for: option)?.lit ?? 0
-        slider.render(levelCount: levels.count, index: lit > 0 ? lit - 1 : nil, enabled: enabled)
+        slider.render(levelCount: levels.count, index: lit > 0 ? lit - 1 : nil, enabled: enabled, animated: animated)
         slider.setAccessibilityValueDescription(title)
     }
 
@@ -231,6 +230,131 @@ final class ComposerOptionsView: NSStackView {
 }
 
 @MainActor
+private final class EffortReadout: NSControl {
+    private let button: ActionButton
+    private let words = CALayer()
+    private var titles: [String] = []
+    private var labels: [CATextLayer] = []
+    private var selectedIndex = 0
+    private let titleFont = NSFont.systemFont(ofSize: 14, weight: .medium)
+    private var textColor = WorkspaceStyle.modelFocus
+
+    init(action: @escaping () -> Void) {
+        button = ActionButton("Effort", iconOnly: true, style: .subtle, action: action)
+        super.init(frame: .zero)
+        wantsLayer = true
+        words.masksToBounds = true
+        layer?.addSublayer(words)
+        fill(button, in: self)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isEnabled: Bool { didSet { button.isEnabled = isEnabled } }
+
+    override var intrinsicContentSize: NSSize {
+        let width = titles.map { ($0 as NSString).size(withAttributes: [.font: titleFont]).width }.max() ?? 0
+        return NSSize(width: ceil(width) + 10, height: 21)
+    }
+
+    func render(_ title: String, levels: [String], index: Int, color: NSColor, animated: Bool) {
+        let next = levels.isEmpty ? [title] : levels
+        let index = levels.isEmpty ? 0 : index
+        let previous = selectedIndex
+        let sameLevels = titles == next
+        selectedIndex = index
+        button.setAccessibilityValue(title)
+        button.toolTip = toolTip
+        textColor = color
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if !sameLevels {
+            titles = next
+            words.sublayers = nil
+            labels = next.map { word in
+                let label = CATextLayer()
+                label.string = word
+                label.font = titleFont
+                label.fontSize = titleFont.pointSize
+                label.alignmentMode = .center
+                words.addSublayer(label)
+                return label
+            }
+            invalidateIntrinsicContentSize()
+            needsLayout = true
+        }
+        CATransaction.commit()
+        updateColors()
+        if !animated || !sameLevels || index != previous {
+            positionLabels(animated: animated && sameLevels && window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColors()
+    }
+
+    private func updateColors() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            for label in labels { label.foregroundColor = textColor.cgColor }
+        }
+        CATransaction.commit()
+    }
+
+    override func layout() {
+        super.layout()
+        let size = bounds.size
+        guard words.frame.size != size else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        words.frame = bounds
+        CATransaction.commit()
+        positionLabels(animated: false)
+    }
+
+    private func positionLabels(animated: Bool) {
+        let scale = window?.backingScaleFactor ?? 2
+        let lineHeight = ceil(titleFont.ascender - titleFont.descender)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, label) in labels.enumerated() {
+            let position = words.bounds.midY + CGFloat(selectedIndex - index) * lineHeight * 0.67
+            let opacity: Float = index == selectedIndex ? 1 : 0
+            let previous = label.presentation() ?? label
+            let startY = previous.position.y
+            let startOpacity = previous.opacity
+            label.contentsScale = scale
+            label.bounds.size = NSSize(width: words.bounds.width, height: lineHeight)
+            label.position = CGPoint(x: words.bounds.midX, y: position)
+            label.opacity = opacity
+            if animated {
+                label.add(effortSpring("position.y", from: startY, to: position, stiffness: 300, damping: 27), forKey: "roll")
+                label.add(effortSpring("opacity", from: startOpacity, to: opacity, stiffness: 300, damping: 27), forKey: "fade")
+            } else {
+                label.removeAllAnimations()
+            }
+        }
+        CATransaction.commit()
+    }
+}
+
+@MainActor
+private func effortSpring(_ keyPath: String, from: Any, to: Any, stiffness: CGFloat, damping: CGFloat) -> CASpringAnimation {
+    let animation = CASpringAnimation(keyPath: keyPath)
+    animation.mass = 1
+    animation.stiffness = stiffness
+    animation.damping = damping
+    animation.fromValue = from
+    animation.toValue = to
+    animation.duration = animation.settlingDuration
+    return animation
+}
+
+@MainActor
 private final class EffortSlider: NSSlider {
     private let rail = CALayer()
     private let fill = CALayer()
@@ -239,7 +363,11 @@ private final class EffortSlider: NSSlider {
     private let thumb = CALayer()
     private var selectedIndex: Int?
     private var laidOutTickCount = 0
-    private var dragging = false
+    private var dragOffset: CGFloat?
+    private var draggedX: CGFloat?
+    private var pressed = false
+    private var hovered = false
+    private var tracking: NSTrackingArea?
 
     override var knobThickness: CGFloat { 28 }
 
@@ -255,9 +383,9 @@ private final class EffortSlider: NSSlider {
         rail.borderWidth = 0.5
         fill.anchorPoint = CGPoint(x: 0, y: 0.5)
         fill.masksToBounds = true
-        thumb.bounds.size = CGSize(width: 27, height: 27)
-        thumb.cornerRadius = 13.5
-        thumb.borderWidth = 1
+        thumb.bounds.size = CGSize(width: 28, height: 28)
+        thumb.cornerRadius = 14
+        thumb.borderWidth = 0.5
         fill.isHidden = true
         thumb.isHidden = true
         rail.addSublayer(inactiveDots)
@@ -271,12 +399,13 @@ private final class EffortSlider: NSSlider {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    func render(levelCount: Int, index: Int?, enabled: Bool) {
+    func render(levelCount: Int, index: Int?, enabled: Bool, animated: Bool) {
         let levelsChanged = levelCount != numberOfTickMarks
         let selectionChanged = index != selectedIndex
-        let animate = selectionChanged && selectedIndex != nil && index != nil && !levelsChanged &&
-            !dragging && window != nil && rail.bounds.width > 0 && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let animate = animated && selectionChanged && selectedIndex != nil && index != nil && !levelsChanged &&
+            dragOffset == nil && canAnimate
         selectedIndex = index
+        if !animated || levelsChanged { resetPointer() }
         if levelsChanged {
             maxValue = Double(levelCount - 1)
             numberOfTickMarks = levelCount
@@ -285,9 +414,10 @@ private final class EffortSlider: NSSlider {
         if integerValue != (index ?? 0) { integerValue = index ?? 0 }
         if isEnabled != enabled {
             isEnabled = enabled
+            if !enabled { resetPointer() }
             updateColors()
         }
-        if selectionChanged || levelsChanged { updateIndicator(animated: animate) }
+        if selectionChanged || levelsChanged || !animated { updateIndicator(animated: animate) }
     }
 
     override func layout() {
@@ -326,17 +456,57 @@ private final class EffortSlider: NSSlider {
         updateColors()
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        tracking = area
+        addTrackingArea(area)
+    }
+
+    override func mouseMoved(with event: NSEvent) { updateHover(with: event) }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateThumbScale()
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
         window?.makeFirstResponder(self)
-        select(at: event)
+        pressed = true
+        let point = convert(event.locationInWindow, from: nil)
+        let visibleThumb = (thumb.presentation() ?? thumb).frame
+        if !thumb.isHidden, visibleThumb.contains(point) {
+            let x = (thumb.presentation() ?? thumb).position.x
+            dragOffset = point.x - x
+            draggedX = x
+            updateIndicator(animated: false)
+        } else { select(at: point.x) }
+        updateThumbScale()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        stopAnimations()
-        dragging = true
-        defer { dragging = false }
-        select(at: event)
+        guard isEnabled, let dragOffset else { return }
+        let x = convert(event.locationInWindow, from: nil).x - dragOffset
+        draggedX = min(position(1, in: bounds), max(position(0, in: bounds), x))
+        select(at: x)
+        updateIndicator(animated: false)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let wasDragging = draggedX != nil
+        resetPointer()
+        if wasDragging { updateIndicator(animated: canAnimate) }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            resetPointer()
+            updateIndicator(animated: false)
+        }
     }
 
     override func keyDown(with event: NSEvent) {
@@ -351,11 +521,9 @@ private final class EffortSlider: NSSlider {
 
     override func accessibilityPerformDecrement() -> Bool { step(by: -1) }
 
-    private func select(at event: NSEvent) {
-        guard isEnabled else { return }
+    private func select(at x: CGFloat) {
         let start = position(0, in: bounds)
         let end = position(1, in: bounds)
-        let x = convert(event.locationInWindow, from: nil).x
         let fraction = Double((x - start) / max(1, end - start))
         select(minValue + fraction * (maxValue - minValue))
     }
@@ -375,8 +543,8 @@ private final class EffortSlider: NSSlider {
 
     private func updateIndicator(animated: Bool) {
         let progress = CGFloat(selectedIndex ?? 0) / CGFloat(max(1, numberOfTickMarks - 1))
-        let width = position(progress, in: rail.bounds)
-        let x = rail.frame.minX + width
+        let x = draggedX ?? position(progress, in: rail.frame)
+        let width = max(0, x - rail.frame.minX)
         let previousWidth = (fill.presentation() ?? fill).bounds.width
         let previousX = (thumb.presentation() ?? thumb).position.x
         CATransaction.begin()
@@ -387,20 +555,46 @@ private final class EffortSlider: NSSlider {
         thumb.isHidden = selectedIndex == nil
         CATransaction.commit()
         if animated {
-            animate(fill, property: "bounds.size.width", from: previousWidth, to: width)
-            animate(thumb, property: "position.x", from: previousX, to: x)
+            fill.add(effortSpring("bounds.size.width", from: previousWidth, to: width, stiffness: 300, damping: 27),
+                     forKey: "bounds.size.width")
+            thumb.add(effortSpring("position.x", from: previousX, to: x, stiffness: 300, damping: 27), forKey: "position.x")
         } else {
             stopAnimations()
         }
     }
 
-    private func animate(_ layer: CALayer, property: String, from: CGFloat, to: CGFloat) {
-        let animation = CABasicAnimation(keyPath: property)
-        animation.fromValue = from
-        animation.toValue = to
-        animation.duration = 0.18
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer.add(animation, forKey: property)
+    private var canAnimate: Bool {
+        window != nil && rail.bounds.width > 0 && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func updateHover(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let next = isEnabled && !thumb.isHidden && (thumb.presentation() ?? thumb).frame.contains(point)
+        guard hovered != next else { return }
+        hovered = next
+        updateThumbScale()
+    }
+
+    private func resetPointer() {
+        dragOffset = nil
+        draggedX = nil
+        pressed = false
+        hovered = false
+        updateThumbScale()
+    }
+
+    private func updateThumbScale() {
+        let raised = isEnabled && (pressed || hovered)
+        let scale: CGFloat = canAnimate && raised ? 32 / 28 : 1
+        let before = thumb.presentation()?.transform.m11 ?? thumb.transform.m11
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        thumb.transform = CATransform3DMakeScale(scale, scale, 1)
+        CATransaction.commit()
+        if canAnimate && before != scale {
+            thumb.add(effortSpring("transform.scale", from: before, to: scale,
+                                   stiffness: raised ? 420 : 220, damping: raised ? 38 : 26), forKey: "scale")
+        } else { thumb.removeAnimation(forKey: "scale") }
     }
 
     private func stopAnimations() {
@@ -424,7 +618,7 @@ private final class EffortSlider: NSSlider {
     }
 
     private func position(_ fraction: CGFloat, in bounds: NSRect) -> CGFloat {
-        let inset = min(knobThickness / 2, bounds.width / 2)
+        let inset = min(13, bounds.width / 2)
         return bounds.minX + inset + fraction * (bounds.width - 2 * inset)
     }
 }

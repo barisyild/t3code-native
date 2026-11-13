@@ -40,6 +40,12 @@ final class ConversationController: NSViewController {
         let connection: UUID
     }
 
+    private struct StopTarget: Hashable {
+        let connection: UUID
+        let threadID: String
+        let runID: String?
+    }
+
     private enum Activity {
         case idle, queued, starting, working, waiting, stopping, background, approval, question, failed, offline, archived
 
@@ -151,6 +157,7 @@ final class ConversationController: NSViewController {
     private var questionRequest: (id: String, entry: TimelineEntry)?
     private var approvalTarget: ApprovalTarget?
     private var submittingApprovals = Set<ApprovalTarget>()
+    private var stoppingRuns = Set<StopTarget>()
     private var approvalError: (target: ApprovalTarget, message: String)?
     private var terminalShown = false
     private var startingProjectAction = false
@@ -196,6 +203,7 @@ final class ConversationController: NSViewController {
     var onOpenSideChat: ((String) -> Bool)?
     var onSideChatStarted: ((SideChatReference, Wire) -> Void)?
     var onRelatedConversations: (() -> Void)?
+    var onToggleGoalEditor: ((ConversationController) -> Void)?
 
     init(workspace: Workspace, embedded: Bool = false) {
         self.workspace = workspace
@@ -327,6 +335,7 @@ final class ConversationController: NSViewController {
             }
         }
         composer.onSend = { [weak self] draft in self?.send(draft) }
+        composer.onStop = { [weak self] in self?.stop() }
         composer.onSaveQueuedEdit = { [weak self] draft in self?.saveQueueEdit(draft) }
         composer.onCancelQueuedEdit = { [weak self] in self?.cancelQueueEdit() }
         composer.onWorktree = { [weak self] in self?.chooseWorktree() }
@@ -355,6 +364,10 @@ final class ConversationController: NSViewController {
         composer.onModeChange = { [weak self] kind, value in self?.setMode(kind, value) }
         composer.onEditQueued = { [weak self] in self?.editLastQueuedMessage() ?? false }
         composer.goalBar.onAction = { [weak self] action in self?.runGoalAction(action) }
+        composer.goalBar.onOpenDetails = { [weak self] in
+            guard let self else { return }
+            onToggleGoalEditor?(self)
+        }
         composer.usageLimits.onViewAll = { [weak self] in self?.onShowUsageLimits?() }
         composer.usageLimits.onOpen = { [weak workspace] in
             guard let workspace else { return }
@@ -451,7 +464,6 @@ final class ConversationController: NSViewController {
         let changedThread = draftKey != key
         if changedThread {
             workspace.voiceInput.cancel(owner: voiceOwner)
-            composer.goalBar.closeDetails()
             draftKey = key
             loadComposerDraft()
             timeline.reset()
@@ -515,7 +527,7 @@ final class ConversationController: NSViewController {
         noticeLabel.isHidden = error == nil
         noticeLabel.stringValue = error ?? ""
         let pendingRequests = renderRequest(entries)
-        updateActivity(thread, pending: pendingRequests, entries: entries, canOperate: canOperate)
+        updateActivity(thread, pending: pendingRequests, entries: entries)
         renderQueue()
         renderVoice()
         renderGoal(thread)
@@ -589,7 +601,7 @@ final class ConversationController: NSViewController {
         }
     }
 
-    private func updateActivity(_ thread: ThreadSummary?, pending: [Wire], entries: [TimelineEntry], canOperate: Bool) {
+    private func updateActivity(_ thread: ThreadSummary?, pending: [Wire], entries: [TimelineEntry]) {
         let next: Activity? = thread.map { thread in
             guard workspace.connection == .ready else { return .offline }
             if thread.archived { return .archived }
@@ -636,9 +648,7 @@ final class ConversationController: NSViewController {
         default: nil
         }
         liveActivity.render(live)
-        let canStop = canOperate && thread?.isWorking == true && thread?.archived == false
-        stopButton.isHidden = !canStop
-        stopButton.isEnabled = canStop && next != .stopping
+        renderStopControls()
         let timestamp = next == .starting || next == .working || next == .stopping ? thread?.activeSince : nil
         if activityTimestamp != timestamp {
             activityTimestamp = timestamp
@@ -650,6 +660,7 @@ final class ConversationController: NSViewController {
 
     func refreshActivityTime() {
         if let activityStart { activityTime.stringValue = WorkspaceStyle.elapsed(since: activityStart) }
+        composer.goalBar.refreshElapsedTime()
     }
 
     private func layoutEmptyView() {
@@ -781,7 +792,6 @@ final class ConversationController: NSViewController {
             findBar.dismiss(restoreFocus: false)
             composer.closeModelMenu()
             composer.closeQuote()
-            composer.goalBar.closeDetails()
             composer.usageLimits.close()
         }
         renderVoice()
@@ -1237,13 +1247,40 @@ final class ConversationController: NSViewController {
         }
     }
 
-    private func renderGoal(_ thread: ThreadSummary?) {
-        guard let thread, let goal = thread.goal else { composer.goalBar.render(nil); return }
+    var goalPresentation: ThreadGoalEditor.Presentation? {
+        guard let thread = displayedThread, let goal = thread.goal, let environmentID = workspace.environment?.id else { return nil }
         let owner = displayedGoalOwner
         let canOperate = !thread.archived && workspace.can("orchestration:operate") &&
             !workspace.sending.contains(.thread(thread.id)) &&
             owner?.commandModel(threadModel: thread.model, providers: workspace.providers) != nil
-        composer.goalBar.render(goal, driver: owner?.driver, working: thread.isWorking, canOperate: canOperate)
+        let activeSince = thread.isWorking && !thread.archived && workspace.connection == .ready ?
+            WorkspaceStyle.date(thread.activeSince) : nil
+        let providerUpdatedAt = displayedDetail.goalTimeUpdatedAt(for: goal, providerThreadID: thread.activeProviderThreadID)
+        let timing = goal.timing(activeSince: activeSince, providerUpdatedAt: providerUpdatedAt)
+        return .init(environmentID: environmentID, threadID: thread.id, providerThreadID: thread.activeProviderThreadID,
+                     latestRunID: thread.latestRunID, working: thread.isWorking, lastError: thread.lastError,
+                     goal: goal, driver: owner?.driver, canEdit: canOperate, timing: timing)
+    }
+
+    private func renderGoal(_ thread: ThreadSummary?) {
+        let presentation = goalPresentation
+        composer.goalBar.render(presentation?.goal, driver: presentation?.driver, working: thread?.isWorking == true,
+                                canOperate: presentation?.canEdit == true, timing: presentation?.timing)
+    }
+
+    func setGoalEditorPresented(_ presented: Bool) { composer.goalBar.setDetailsPresented(presented) }
+
+    func saveGoal(_ command: String, replacing objective: String, target: ThreadGoalEditor.Presentation) async throws {
+        guard let current = goalPresentation, current.environmentID == target.environmentID,
+              current.threadID == target.threadID, current.providerThreadID == target.providerThreadID,
+              current.goal.objective == objective, current.canEdit, let thread = displayedThread, let owner = displayedGoalOwner,
+              let model = owner.commandModel(threadModel: thread.model, providers: workspace.providers) else {
+            throw ClientError.message("The goal is no longer available for editing.")
+        }
+        try await workspace.send(.init(destination: .thread(thread.id), text: command, model: model,
+                                       runtimeMode: thread.runtimeMode ?? "approval-required",
+                                       interactionMode: thread.interactionMode ?? "default", checkout: .root(),
+                                       preparedThreadID: nil, deliveryIntent: "auto"))
     }
 
     private func switchModelNow(_ model: Wire) {
@@ -1470,9 +1507,33 @@ final class ConversationController: NSViewController {
         }
     }
 
+    private var stopTarget: StopTarget? {
+        guard canOperateDisplayedThread, let connection = workspace.connectionID,
+              let thread = displayedThread, thread.isWorking, !thread.archived else { return nil }
+        return .init(connection: connection, threadID: thread.id, runID: thread.activeRunId ?? thread.latestRunID)
+    }
+
+    private func renderStopControls() {
+        let state: ComposerView.StopState
+        if let target = stopTarget {
+            state = displayedThread?.stopRequested == true || stoppingRuns.contains(target) ? .stopping : .available
+        } else { state = .unavailable }
+        stopButton.isHidden = state == .unavailable
+        stopButton.isEnabled = state == .available
+        composer.renderStop(state)
+    }
+
     private func stop() {
-        guard let thread = displayedThread else { return }
-        perform { try await self.workspace.dispatch("thread.stop", threadId: thread.id) }
+        guard let target = stopTarget, displayedThread?.stopRequested != true, stoppingRuns.insert(target).inserted else { return }
+        renderStopControls()
+        perform {
+            defer {
+                self.stoppingRuns.remove(target)
+                self.renderStopControls()
+            }
+            guard self.stopTarget == target, self.displayedThread?.stopRequested != true else { return }
+            try await self.workspace.dispatch("thread.stop", threadId: target.threadID)
+        }
     }
 
     private func setMode(_ kind: String, _ value: String) {
@@ -1618,6 +1679,11 @@ final class ConversationController: NSViewController {
     }
 
     private func addThreadActions(_ thread: ThreadSummary, to menu: NSMenu) {
+        if thread.goal != nil, onToggleGoalEditor != nil {
+            let item = menuItem("Edit Goal…", target: self, action: #selector(editGoalAction))
+            item.image = WorkspaceStyle.symbol("scope", size: 11)
+            menu.addItem(item)
+        }
         if !embedded, workspace.deviceScope != nil {
             let item = menuItem("Toggle Device", target: self, action: #selector(toggleDevice))
             item.image = WorkspaceStyle.symbol("iphone", size: 11)
@@ -1663,6 +1729,8 @@ final class ConversationController: NSViewController {
     }
 
     @objc private func showRelatedConversations() { onRelatedConversations?() }
+
+    @objc private func editGoalAction() { onToggleGoalEditor?(self) }
 
     @objc func openGuestShare() {
         guard canOpenGuestShare, let target = displayedGuestTarget, let thread = displayedThread,

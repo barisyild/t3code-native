@@ -331,11 +331,23 @@ struct TimelineEntry: Equatable, Sendable {
 }
 
 struct ThreadDetail {
+    private struct GoalTime {
+        let objective: String
+        let status: ThreadGoal.Status
+        let seconds: Int
+        let updatedAt: Date
+
+        func matches(_ goal: ThreadGoal) -> Bool {
+            goal.objective == objective && goal.status == status && goal.timeUsedSeconds == seconds
+        }
+    }
+
     private var entries: [TimelineEntry] = []
     private(set) var queue = ThreadQueue()
     private(set) var runModels: [String: Wire] = [:]
     private(set) var requests: [String: Wire] = [:]
     private(set) var goalOwners: [String: ThreadGoal.Owner] = [:]
+    private var goalTimes: [String: GoalTime] = [:]
     private(set) var relationships = ThreadRelationshipProjection()
     private(set) var guestShare: GuestShare?
     private var mergeRuns = ThreadMergeRuns()
@@ -368,6 +380,11 @@ struct ThreadDetail {
         return nil
     }
 
+    func goalTimeUpdatedAt(for goal: ThreadGoal, providerThreadID: String?) -> Date? {
+        guard let providerThreadID, let sample = goalTimes[providerThreadID], sample.matches(goal) else { return nil }
+        return sample.updatedAt
+    }
+
     mutating func apply(_ frame: Wire) {
         switch frame["kind"].string {
         case "snapshot":
@@ -388,7 +405,7 @@ struct ThreadDetail {
                 queue.applyRun(value, message: value["userMessageId"].string.flatMap { recentMessages[$0] })
             case "message.updated": rememberMessage(value)
             case "provider-thread.updated":
-                if let id = value["id"].string { goalOwners[id] = ThreadGoal.Owner(value) }
+                applyProviderThread(value)
             case "runtime-request.updated": applyRequest(value)
             case "thread.guest-share-updated": guestShare = GuestShare(value["guestShare"])
             case "subagent.updated", "context-transfer.created", "context-transfer.updated":
@@ -436,8 +453,20 @@ struct ThreadDetail {
         requests.removeAll()
         for request in projection["runtimeRequests"].array { applyRequest(request) }
         goalOwners.removeAll()
-        for provider in projection["providerThreads"].array {
-            if let id = provider["id"].string { goalOwners[id] = ThreadGoal.Owner(provider) }
+        goalTimes.removeAll()
+        for provider in projection["providerThreads"].array { applyProviderThread(provider) }
+    }
+
+    private mutating func applyProviderThread(_ value: Wire) {
+        guard let id = value["id"].string else { return }
+        goalOwners[id] = ThreadGoal.Owner(value)
+        guard let goal = ThreadGoal(value["goal"]), let seconds = goal.timeUsedSeconds, seconds >= 0,
+              let updatedAt = WorkspaceStyle.date(value["updatedAt"].string) else {
+            goalTimes.removeValue(forKey: id)
+            return
+        }
+        if goalTimes[id]?.matches(goal) != true {
+            goalTimes[id] = .init(objective: goal.objective, status: goal.status, seconds: seconds, updatedAt: updatedAt)
         }
     }
 
